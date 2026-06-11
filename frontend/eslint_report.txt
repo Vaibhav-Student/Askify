@@ -1,0 +1,45 @@
+﻿
+C:\Users\Lenovo\Desktop\Project\AI\P1\frontend\src\components\ApiKeyInput.jsx
+  13:13  error  Error: Calling setState synchronously within an effect can trigger cascading renders
+
+Effects are intended to synchronize state between React and external systems such as manually updating the DOM, state management libraries, or other platform APIs. In general, the body of an effect should do one or both of the following:
+* Update external systems with the latest state from React.
+* Subscribe for updates from some external system, calling setState in a callback function when external state changes.
+
+Calling setState synchronously within an effect body causes cascading renders that can hurt performance, and is not recommended. (https://react.dev/learn/you-might-not-need-an-effect).
+
+  11 |         const storedKey = localStorage.getItem(`api_key_${toolId}`);
+  12 |         if (storedKey) {
+> 13 |             setApiKey(storedKey);
+     |             ^^^^^^^^^ Avoid calling setState() directly within an effect
+  14 |             setHasKey(true);
+  15 |         } else {
+  16 |             setApiKey('');  react-hooks/set-state-in-effect
+
+C:\Users\Lenovo\Desktop\Project\AI\P1\frontend\src\components\ChatArea.jsx
+   1:28  error    'useEffect' is defined but never used. Allowed unused vars must match /^[A-Z_]/u                                      no-unused-vars
+  36:6   warning  React Hook useMemo has an unnecessary dependency: 'selectedToolId'. Either exclude it or remove the dependency array  react-hooks/exhaustive-deps
+  39:9   error    'currentModel' is assigned a value but never used. Allowed unused vars must match /^[A-Z_]/u                          no-unused-vars
+
+C:\Users\Lenovo\Desktop\Project\AI\P1\frontend\src\components\Sidebar.jsx
+   48:3   warning  Unused eslint-disable directive (no problems were reported from 'react-hooks/set-state-in-effect')
+   50:5   error    Error: Calling setState synchronously within an effect can trigger cascading renders
+
+Effects are intended to synchronize state between React and external systems such as manually updating the DOM, state management libraries, or other platform APIs. In general, the body of an effect should do one or both of the following:
+* Update external systems with the latest state from React.
+* Subscribe for updates from some external system, calling setState in a callback function when external state changes.
+
+Calling setState synchronously within an effect body causes cascading renders that can hurt performance, and is not recommended. (https://react.dev/learn/you-might-not-need-an-effect).
+
+  48 |   // eslint-disable-next-line react-hooks/set-state-in-effect
+  49 |   useEffect(() => {
+> 50 |     loadDocuments();
+     |     ^^^^^^^^^^^^^ Avoid calling setState() directly within an effect
+  51 |   }, [loadDocuments]);
+  52 |
+  53 |   async function handleFiles(files) {  react-hooks/set-state-in-effect
+  187:15  error    Definition for rule 'react/no-unknown-property' was not found                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 react/no-unknown-property
+
+✖ 7 problems (5 errors, 2 warnings)
+  0 errors and 1 warning potentially fixable with the `--fix` option.
+
