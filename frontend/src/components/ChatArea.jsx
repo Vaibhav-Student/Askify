@@ -1,10 +1,29 @@
 import { useState, useRef, useEffect, useMemo } from 'react';
+import Lenis from 'lenis';
 import Message, { LoadingMessage } from './Message';
-import { Menu, Send, BookOpen, BarChart3, FileText, TrendingUp, ClipboardList, Sparkles, Sun, Moon, X, UploadCloud, Plus, Folder, Edit2, Terminal, Activity } from './Icons';
-import { AI_TOOLS, getDefaultModel } from '../config/toolsData';
+import { Menu, Send, BookOpen, BarChart3, FileText, TrendingUp, ClipboardList, Sparkles, Sun, Moon, X, UploadCloud, Plus, Folder, Edit2 } from './Icons';
 import { uploadFile, deleteDocument } from '../api';
-import { UploadEngine, UploadStatus, isSmallFile, formatBytes } from '../uploadEngine';
+import { UploadEngine, UploadStatus, isSmallFile } from '../uploadEngine';
 import { checkUnsupportedFeature } from '../featureGuard';
+import { AI_TOOLS } from '../config/toolsData';
+
+export function getShortDocumentName(filename) {
+  if (!filename) return '';
+  let base = filename.replace(/\.[^.]+$/, "");
+  base = base.replace(/^\d+[_-]/, "");
+  base = base.replace(/[_-]/g, " ").trim();
+  if (base.includes(" - ")) {
+    const parts = base.split(" - ");
+    base = parts[parts.length - 1].trim();
+  } else if (base.includes(" -")) {
+    const parts = base.split(" -");
+    base = parts[parts.length - 1].trim();
+  } else if (base.includes("- ")) {
+    const parts = base.split("- ");
+    base = parts[parts.length - 1].trim();
+  }
+  return base;
+}
 
 function parseAgenticStream(rawText) {
   const steps = [];
@@ -58,34 +77,72 @@ function parseAgenticStream(rawText) {
         title: title.replace(/^\*+|\*+$/g, '').trim(),
         content: body
       });
-    } else if (firstChar === '📚') {
+    } else if (firstChar === '📚' || trimmed.startsWith('**Answer:**')) {
       hasAnswer = true;
-      const answerBody = rest.replace(/^\*\*Answer:\*\*\s*/i, '').trim();
+      const answerBody = (firstChar === '📚' ? rest : trimmed)
+        .replace(/^\*\*Answer:\*\*\s*/i, '')
+        .replace(/^Answer:\s*/i, '')
+        .trim();
       cleanContent = answerBody;
     }
   }
 
   if (!hasAnswer) {
-    cleanContent = '';
+    // Extremely robust fallback: if the model didn't output the 📚 symbol,
+    // or we have raw content, we must display the response so the user is never left with an empty screen.
+    // If there are no steps or no emojis at all, the entire rawText is the answer.
+    if (steps.length === 0) {
+      cleanContent = rawText;
+    } else {
+      // If there are step emojis but no 📚 symbol, let's treat the text of the last part as the answer,
+      // or fall back to displaying the whole rawText as a robust backup.
+      cleanContent = rawText;
+    }
   }
+
+  // Double-clean any leading answer marker from the beginning
+  cleanContent = cleanContent
+    .replace(/^\s*(\*\*)?Answer:(\*\*)?\s*/gi, '')
+    .trim();
 
   return { cleanContent, steps };
 }
 
+const ICON_MAP = {
+  BookOpen: <BookOpen size={16} />,
+  BarChart3: <BarChart3 size={16} />,
+  FileText: <FileText size={16} />,
+  TrendingUp: <TrendingUp size={16} />,
+  ClipboardList: <ClipboardList size={16} />,
+  Sparkles: <Sparkles size={16} />
+};
+
 const DEFAULT_CHIPS = [
-  { label: 'Explain Topic', icon: <BookOpen size={16} />, query: 'Explain ' },
-  { label: 'Compare', icon: <BarChart3 size={16} />, query: 'Compare ' },
-  { label: 'Solve Question', icon: <FileText size={16} />, query: 'Solve: ' },
-  { label: 'Study Plan', icon: <TrendingUp size={16} />, query: 'Create a study roadmap for ' },
-  { label: 'Summarize', icon: <ClipboardList size={16} />, query: 'Summarize ' },
+  { id: 'explain', label: 'Explain Topic', iconName: 'BookOpen', query: 'Explain ', tooltip: 'Get a clear, structured explanation of any topic with examples' },
+  { id: 'compare', label: 'Compare', iconName: 'BarChart3', query: 'Compare ', tooltip: 'Compare two or more concepts side by side with a detailed table' },
+  { id: 'solve', label: 'Solve Question', iconName: 'FileText', query: 'Solve: ', tooltip: 'Get step-by-step solutions to homework and practice problems' },
+  { id: 'roadmap', label: 'Study Plan', iconName: 'TrendingUp', query: 'Create a study roadmap for ', tooltip: 'Generate a personalized study plan with milestones and timelines' },
+  { id: 'summarize', label: 'Summarize', iconName: 'ClipboardList', query: 'Summarize ', tooltip: 'Get concise summaries of long documents or complex topics' },
+  { id: 'gencode', label: 'GenCode', iconName: 'Sparkles', query: 'Generate clean, efficient code for ', tooltip: 'Generate production-ready code snippets in any language' },
+  { id: 'brainstorm', label: 'Brainstorm', iconName: 'Sparkles', query: 'Brainstorm creative ideas for ', tooltip: 'Generate creative ideas, outlines, and mind maps for projects' },
+  { id: 'keyconcepts', label: 'Key Concepts', iconName: 'Sparkles', query: 'Identify and explain the key concepts of ', tooltip: 'Extract and explain the most important concepts from any topic' },
+  { id: 'quiz', label: 'Practice Quiz', iconName: 'Sparkles', query: 'Create a practice quiz for ', tooltip: 'Generate practice questions with answers and explanations' }
 ];
 
 const ALLOWED_EXTENSIONS = [
-  'pdf', 'docx', 'doc', 'pptx', 'ppt', 'xlsx', 'xls', 'txt', 'md',
-  'jpg', 'jpeg', 'png', 'webp', 'svg'
+  'pdf', 'docx', 'doc', 'pptx', 'ppt', 'xlsx', 'xls', 'txt', 'md'
 ];
 
 const VIDEO_MAX_DURATION = 600; // 10 minutes in seconds
+
+const LOADING_PHASES = [
+  { emoji: '🧠', text: 'Thinking...' },
+  { emoji: '🔍', text: 'Analyzing...' },
+  { emoji: '⚡', text: 'Processing...' },
+  { emoji: '🤖', text: 'Generating...' },
+  { emoji: '📝', text: 'Formatting...' },
+  { emoji: '✨', text: 'Finalizing...' },
+];
 
 export default function ChatArea({
   messages,
@@ -104,26 +161,42 @@ export default function ChatArea({
   introComplete,
   studyHubOpen,
   onToggleStudyHub,
-  activeDocForViewer,
   setActiveDocForViewer
 }) {
   const [query, setQuery] = useState('');
   const [selectedChip, setSelectedChip] = useState(null);
   const [isGenerating, setIsGenerating] = useState(false);
-  const [status, setStatus] = useState('');
   const [editingChip, setEditingChip] = useState(null);
-  const [customChips, setCustomChips] = useState([]);
+  const [chips, setChips] = useState(() => {
+    const saved = localStorage.getItem('study_chips');
+    if (saved) {
+      try {
+        return JSON.parse(saved);
+      } catch (e) {
+        console.error('Failed to parse study chips', e);
+      }
+    }
+    return DEFAULT_CHIPS;
+  });
+
+  useEffect(() => {
+    localStorage.setItem('study_chips', JSON.stringify(chips));
+  }, [chips]);
   const [showAddChip, setShowAddChip] = useState(false);
   const [newChipLabel, setNewChipLabel] = useState('');
   const [newChipQuery, setNewChipQuery] = useState('');
-  const messagesEndRef = useRef(null);
-  const textareaRef = useRef(null);
-  const fileInputRef = useRef(null);
-  const prewarmTimeoutRef = useRef(null);
+  const [isDragging, setIsDragging] = useState(false);
   const [uploadQueue, setUploadQueue] = useState([]);
   const [showUploadMenu, setShowUploadMenu] = useState(false);
+  const [showKnowledgePopup, setShowKnowledgePopup] = useState(false);
+
+  const messagesEndRef = useRef(null);
+  const fileInputRef = useRef(null);
   const folderInputRef = useRef(null);
-  const [isDragging, setIsDragging] = useState(false);
+  const textareaRef = useRef(null);
+  const prewarmTimeoutRef = useRef(null);
+
+
 
   function handleDragOver(e) {
     e.preventDefault();
@@ -159,18 +232,30 @@ export default function ChatArea({
 
   const engine = useMemo(() => new UploadEngine({ chunkSize: 2 * 1024 * 1024 }), []);
 
-  useEffect(() => {
-    const saved = localStorage.getItem('custom_chips');
-    if (saved) {
-      try {
-        setCustomChips(JSON.parse(saved));
-      } catch (e) {
-        console.error('Failed to parse custom chips', e);
-      }
-    }
-  }, []);
+  // Chips loaded inline via state initializer
 
   const lastMessageCountRef = useRef(messages.length);
+
+  // Initialize Lenis smooth scroll on the conversation container
+  useEffect(() => {
+    const container = document.querySelector('.conversation');
+    if (!container) return;
+
+    const lenis = new Lenis({
+      wrapper: container,
+      content: container.querySelector('.conversation-inner'),
+      duration: 1.2,
+      easing: (t) => Math.min(1, 1.001 - Math.pow(2, -10 * t)),
+      autoRaf: true,
+    });
+
+    window.lenis = lenis;
+
+    return () => {
+      lenis.destroy();
+      window.lenis = null;
+    };
+  }, []);
 
   useEffect(() => {
     const container = document.querySelector('.conversation');
@@ -184,7 +269,14 @@ export default function ChatArea({
     const isAtBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 120;
 
     if (isNewMessage || isAtBottom) {
-      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+      if (window.lenis) {
+        window.lenis.scrollTo(messagesEndRef.current, {
+          duration: 0.8,
+          easing: (t) => Math.min(1, 1.001 - Math.pow(2, -10 * t)),
+        });
+      } else {
+        messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+      }
     }
   }, [messages, isGenerating]);
 
@@ -205,17 +297,10 @@ export default function ChatArea({
   useEffect(() => {
     if (messages.length === 0) {
       setIsGenerating(false);
-      setStatus('');
     }
   }, [messages]);
 
-  const allChips = useMemo(() => {
-    return [...DEFAULT_CHIPS, ...customChips.map(c => ({
-      ...c,
-      icon: <Sparkles size={16} />,
-      isCustom: true
-    }))];
-  }, [customChips]);
+  // Chips managed via chips state directly
 
   function updateQueueItem(id, updates) {
     setUploadQueue(prev =>
@@ -230,65 +315,81 @@ export default function ChatArea({
 
 
   async function handleFiles(files) {
-    for (const file of files) {
+    const fileArray = Array.from(files).filter(file => {
       const ext = file.name.split('.').pop().toLowerCase();
       if (!ALLOWED_EXTENSIONS.includes(ext)) {
-        showNotification(`File type .${ext} is not supported. Please upload documents or images.`, 'error');
-        continue;
+        showNotification(`File type .${ext} is not supported.`, 'error');
+        return false;
       }
+      return true;
+    });
 
+    if (fileArray.length === 0) return;
+
+    // Create all queue entries up-front so the panel appears immediately
+    const entries = fileArray.map(file => {
       const fileName = file.webkitRelativePath || file.name;
-      const queueId = `${fileName}-${Date.now()}`;
-      const queueItem = {
-        id: queueId,
-        name: fileName,
-        size: file.size,
+      const queueId  = `${fileName}-${Date.now()}-${Math.random()}`;
+      return { file, fileName, queueId };
+    });
+
+    setShowKnowledgePopup(true);
+
+    setUploadQueue(prev => [
+      ...prev,
+      ...entries.map(({ fileName, queueId }) => ({
+        id:       queueId,
+        name:     fileName,
+        size:     fileArray.find(f => (f.webkitRelativePath || f.name) === fileName)?.size ?? 0,
         progress: 0,
-        status: UploadStatus.PENDING,
+        status:   UploadStatus.PENDING,
         uploadId: null,
-      };
+      })),
+    ]);
 
-      setUploadQueue(prev => [...prev, queueItem]);
-
-      if (isSmallFile(file)) {
-        updateQueueItem(queueId, { status: UploadStatus.UPLOADING });
-        try {
-          await uploadFile(file);
-          updateQueueItem(queueId, { status: UploadStatus.COMPLETE, progress: 1 });
-          showNotification(`Processed ${file.name}`, 'success');
-          onDocumentsChange?.();
-          setTimeout(() => removeQueueItem(queueId), 3000);
-        } catch (err) {
-          updateQueueItem(queueId, { status: UploadStatus.FAILED });
-          showNotification(`Error: ${err.message}`, 'error');
+    // Upload all files in parallel
+    await Promise.allSettled(
+      entries.map(async ({ file, queueId }) => {
+        if (isSmallFile(file)) {
+          updateQueueItem(queueId, { status: UploadStatus.UPLOADING });
+          try {
+            await uploadFile(file);
+            updateQueueItem(queueId, { status: UploadStatus.COMPLETE, progress: 1 });
+            showNotification(`✓ ${file.name} ready`, 'success');
+            onDocumentsChange?.();
+            setTimeout(() => removeQueueItem(queueId), 3000);
+          } catch (err) {
+            updateQueueItem(queueId, { status: UploadStatus.FAILED });
+            showNotification(`Error: ${err.message}`, 'error');
+          }
+        } else {
+          try {
+            const uploadId = await engine.uploadFile(file, {
+              onProgress(progress) {
+                updateQueueItem(queueId, { progress });
+              },
+              onStatusChange(status) {
+                updateQueueItem(queueId, { status });
+              },
+              onComplete(result) {
+                updateQueueItem(queueId, { status: UploadStatus.COMPLETE, progress: 1 });
+                showNotification(result.message || `✓ ${file.name} ready`, 'success');
+                onDocumentsChange?.();
+                setTimeout(() => removeQueueItem(queueId), 3000);
+              },
+              onError(err) {
+                updateQueueItem(queueId, { status: UploadStatus.FAILED });
+                showNotification(`Error: ${err.message}`, 'error');
+              },
+            });
+            updateQueueItem(queueId, { uploadId });
+          } catch (err) {
+            updateQueueItem(queueId, { status: UploadStatus.FAILED });
+            showNotification(`Error: ${err.message}`, 'error');
+          }
         }
-      } else {
-        try {
-          const uploadId = await engine.uploadFile(file, {
-            onProgress(progress) {
-              updateQueueItem(queueId, { progress });
-            },
-            onStatusChange(status) {
-              updateQueueItem(queueId, { status });
-            },
-            onComplete(result) {
-              updateQueueItem(queueId, { status: UploadStatus.COMPLETE, progress: 1 });
-              showNotification(result.message || `Processed ${file.name}`, 'success');
-              onDocumentsChange?.();
-              setTimeout(() => removeQueueItem(queueId), 3000);
-            },
-            onError(err) {
-              updateQueueItem(queueId, { status: UploadStatus.FAILED });
-              showNotification(`Error: ${err.message}`, 'error');
-            },
-          });
-          updateQueueItem(queueId, { uploadId });
-        } catch (err) {
-          updateQueueItem(queueId, { status: UploadStatus.FAILED });
-          showNotification(`Error: ${err.message}`, 'error');
-        }
-      }
-    }
+      }),
+    );
   }
   async function handleDeleteDocument(filename) {
     try {
@@ -337,7 +438,6 @@ export default function ChatArea({
     if (textareaRef.current) textareaRef.current.style.height = 'auto';
 
     setIsGenerating(true);
-    setStatus('Thinking...');
 
     let assistantMsg = { role: 'assistant', content: '', rawContent: '', steps: [], intent: '', sources: [] };
     setMessages((prev) => [...prev, assistantMsg]);
@@ -349,7 +449,7 @@ export default function ChatArea({
         body: JSON.stringify({
           query: trimmed,
           provider: 'nvidia',
-          model: 'google/gemma-3n-e4b-it',
+          model: AI_TOOLS[0].models[0].id,
           api_key: ''
         }),
       });
@@ -368,6 +468,15 @@ export default function ChatArea({
       let buffer = '';
       let accumulatedContent = '';
       let lastUpdateTime = 0;
+      let pendingUpdate = null;
+
+      // Use requestAnimationFrame for smooth updates
+      const flushPendingUpdate = () => {
+        if (pendingUpdate) {
+          setMessages(pendingUpdate);
+          pendingUpdate = null;
+        }
+      };
 
       while (true) {
         const { value, done } = await reader.read();
@@ -399,18 +508,25 @@ export default function ChatArea({
               assistantMsg.steps = steps;
 
               const now = Date.now();
-              if (now - lastUpdateTime > 45 || !cleanContent) {
+              // Update at most every 100ms for smooth rendering
+              if (now - lastUpdateTime > 100 || !cleanContent) {
                 lastUpdateTime = now;
-                setMessages((prev) => {
+                pendingUpdate = (prev) => {
                   const updated = [...prev];
                   updated[updated.length - 1] = { ...assistantMsg };
                   return updated;
-                });
+                };
+                // Schedule flush on next frame
+                requestAnimationFrame(flushPendingUpdate);
               }
-              setStatus('Generating...');
+              // Don't override loading animation status
             }
 
             if (data.done) {
+              // Flush any pending update immediately
+              if (pendingUpdate) {
+                flushPendingUpdate();
+              }
               const { cleanContent, steps } = parseAgenticStream(accumulatedContent);
               
               assistantMsg = { 
@@ -459,7 +575,6 @@ export default function ChatArea({
     }
 
     setIsGenerating(false);
-    setStatus('');
   }
 
   function handleKeyDown(e) {
@@ -503,7 +618,7 @@ export default function ChatArea({
       body: JSON.stringify({
         query: fullPrompt,
         provider: 'nvidia',
-        model: 'google/gemma-3n-e4b-it',
+        model: AI_TOOLS[0].models[0].id,
         api_key: ''
       })
     }).catch(err => console.debug('Prewarm error:', err));
@@ -556,45 +671,39 @@ export default function ChatArea({
     
     if (editingChip) {
       // Editing existing chip
-      const updated = customChips.map(c => 
-        c.label === editingChip.label ? { label: newChipLabel.trim(), query: newChipQuery.trim() } : c
+      const updated = chips.map(c => 
+        c.id === editingChip.id ? { ...c, label: newChipLabel.trim(), query: newChipQuery.trim() } : c
       );
-      setCustomChips(updated);
-      localStorage.setItem('custom_chips', JSON.stringify(updated));
+      setChips(updated);
       showNotification(`Template "${newChipLabel.trim()}" updated!`, 'success');
       
       // If the edited template was currently selected, update it
-      if (selectedChip?.label === editingChip.label) {
+      if (selectedChip?.id === editingChip.id) {
         setSelectedChip({
+          ...selectedChip,
           label: newChipLabel.trim(),
-          query: newChipQuery.trim(),
-          icon: selectedChip.icon,
-          isCustom: true
+          query: newChipQuery.trim()
         });
       }
     } else {
       // Adding new chip
-      const newChip = { label: newChipLabel.trim(), query: newChipQuery.trim() };
-      const updated = [...customChips, newChip];
-      setCustomChips(updated);
-      localStorage.setItem('custom_chips', JSON.stringify(updated));
+      const newChip = { 
+        id: `custom-${Date.now()}`,
+        label: newChipLabel.trim(), 
+        query: newChipQuery.trim(),
+        iconName: 'Sparkles'
+      };
+      const updated = [...chips, newChip];
+      setChips(updated);
       showNotification(`New template "${newChipLabel.trim()}" added!`, 'success');
     }
     
     handleCloseAddChip();
   }
 
-  function deleteCustomChip(label) {
-    const updated = customChips.filter(c => c.label !== label);
-    setCustomChips(updated);
-    localStorage.setItem('custom_chips', JSON.stringify(updated));
-    if (selectedChip?.label === label) setSelectedChip(null);
-    showNotification('Template deleted', 'info');
-  }
-
   return (
     <main 
-      className="main-content"
+      className={`main-content ${studyHubOpen ? 'study-hub-open' : ''} ${sidebarOpen ? 'sidebar-open' : ''}`}
       onDragEnter={handleDragEnter}
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
@@ -612,33 +721,15 @@ export default function ChatArea({
 
       {/* Floating sidebar toggle */}
       <button
-        className="sidebar-toggle-float"
-        onClick={onToggleSidebar}
-        aria-label="Toggle Sidebar"
-        title={sidebarOpen ? "Hide Sidebar" : "Show Sidebar"}
-      >
-        <Menu size={18} />
-      </button>
+          className={`sidebar-toggle-float ${sidebarOpen ? 'sidebar-open-toggle-shift' : ''}`}
+          title={sidebarOpen ? "Hide Sidebar" : "Show Sidebar"}
+          onClick={onToggleSidebar}
+          aria-label="Toggle Sidebar"
+        >
+          <Menu size={18} />
+        </button>
 
-      {/* Floating Study Hub toggle */}
-      <button
-        className={`study-hub-toggle ${studyHubOpen ? 'active' : ''}`}
-        onClick={onToggleStudyHub}
-        aria-label="Toggle Study Hub"
-        title={studyHubOpen ? "Hide Study Hub" : "Show Study Hub"}
-      >
-        <BookOpen size={18} />
-      </button>
 
-      {/* Floating theme toggle */}
-      <button
-        className="theme-toggle"
-        onClick={(e) => toggleTheme(e)}
-        aria-label="Toggle Theme"
-        title={`Switch to ${theme === 'dark' ? 'Light' : 'Dark'} Mode`}
-      >
-        {theme === 'dark' ? <Sun size={18} /> : <Moon size={18} />}
-      </button>
 
       {/* Navbar hidden but preserved */}
       <header className="topbar" style={{ display: 'none' }}>
@@ -666,45 +757,30 @@ export default function ChatArea({
                 AI Academic Assistant
               </div>
               <h2 className="welcome-heading">What can I help you study?</h2>
-              <p className="welcome-sub">Upload your materials and ask anything — explanations, comparisons, solutions, study plans.</p>
+              <p className="welcome-sub">Ask anything — explanations, comparisons, solutions, study plans.</p>
               
-              <div className="welcome-dropzone" onClick={() => fileInputRef.current?.click()}>
-                <UploadCloud size={32} className="dropzone-icon" />
-                <span className="dropzone-title">Drag & drop files here to index</span>
-                <span className="dropzone-subtitle">Supports PDF, DOC, DOCX, PPTX, XLSX, TXT, MD, JPG, JPEG, PNG, WEBP, SVG (Max 500MB)</span>
-              </div>
-
               <div className="welcome-grid">
-                {allChips.map((chip) => (
-                  <div key={chip.label} className="welcome-card-wrapper" style={{ position: 'relative' }}>
-                    <button className="welcome-card" onClick={() => handleChip(chip)}>
-                      <span className="welcome-card-icon">{chip.icon}</span>
+                {chips.map((chip) => (
+                  <div key={chip.id} className="welcome-card-wrapper" style={{ position: 'relative' }}>
+                    <button className="welcome-card" title={chip.tooltip} onClick={() => handleChip(chip)}>
+                      <span className="welcome-card-icon">{ICON_MAP[chip.iconName] || <Sparkles size={16} />}</span>
                       <span className="welcome-card-label">{chip.label}</span>
                     </button>
-                    {chip.isCustom && (
-                      <>
-                        <button 
-                          className="chip-edit-float" 
-                          onClick={(e) => { e.stopPropagation(); handleStartEditChip(chip); }}
-                          title="Edit template"
-                        >
-                          <Edit2 size={10} />
-                        </button>
-                        <button 
-                          className="chip-delete-float" 
-                          onClick={(e) => { e.stopPropagation(); deleteCustomChip(chip.label); }}
-                          title="Delete template"
-                        >
-                          <X size={10} />
-                        </button>
-                      </>
-                    )}
+                    <button 
+                        className="chip-edit-float" 
+                        title="Edit template"
+                        onClick={(e) => { e.stopPropagation(); handleStartEditChip(chip); }}
+                      >
+                        <Edit2 size={10} />
+                      </button>
                   </div>
                 ))}
-                <button className="welcome-card add-chip-card" onClick={() => setShowAddChip(true)}>
-                  <span className="welcome-card-icon"><Sparkles size={16} /></span>
-                  <span className="welcome-card-label">+ New Box</span>
-                </button>
+                <div className="welcome-card-wrapper" style={{ position: 'relative' }}>
+                    <button className="welcome-card add-chip-card" title="Create your own custom prompt template" onClick={() => setShowAddChip(true)}>
+                      <span className="welcome-card-icon"><Sparkles size={16} /></span>
+                      <span className="welcome-card-label">+ New Box</span>
+                    </button>
+                  </div>
               </div>
             </div>
           )}
@@ -717,6 +793,7 @@ export default function ChatArea({
                 content={msg.content}
                 intent={msg.intent}
                 sources={msg.sources}
+                isTyping={isGenerating && msg.role === 'assistant' && i === messages.length - 1}
                 onDelete={() => handleDeleteMessage(i)}
                 onEdit={(newContent) => handleEditMessage(i, newContent)}
                 onSourceClick={(sourceName) => {
@@ -736,29 +813,18 @@ export default function ChatArea({
         <div className={`composer-inner ${introComplete ? 'animate-in' : ''}`}>
           {!showWelcome && !selectedChip && (
             <div className="composer-chips">
-              {allChips.map((chip) => (
-                <div key={chip.label} className="chip-wrapper" style={{ display: 'flex', alignItems: 'center' }}>
+              {chips.map((chip) => (
+                <div key={chip.id} className="chip-wrapper" style={{ display: 'flex', alignItems: 'center' }}>
                   <button className="chip" onClick={() => handleChip(chip)}>
-                    {chip.icon} {chip.label}
+                    {ICON_MAP[chip.iconName] || <Sparkles size={16} />} {chip.label}
                   </button>
-                  {chip.isCustom && (
-                    <>
-                      <button 
-                        className="chip-edit-btn" 
-                        onClick={(e) => { e.stopPropagation(); handleStartEditChip(chip); }}
-                        title="Edit"
-                      >
-                        <Edit2 size={10} />
-                      </button>
-                      <button 
-                        className="chip-delete-btn" 
-                        onClick={(e) => { e.stopPropagation(); deleteCustomChip(chip.label); }}
-                        title="Delete"
-                      >
-                        <X size={10} />
-                      </button>
-                    </>
-                  )}
+                  <button 
+                      className="chip-edit-btn" 
+                      title="Edit"
+                      onClick={(e) => { e.stopPropagation(); handleStartEditChip(chip); }}
+                    >
+                      <Edit2 size={10} />
+                    </button>
                 </div>
               ))}
               <button className="chip add-chip-btn" onClick={() => setShowAddChip(true)}>
@@ -767,90 +833,93 @@ export default function ChatArea({
             </div>
           )}
           
-          {status && (
-            <div className="composer-status">
-              <Sparkles size={12} className="status-icon" />
-              <span>{status}</span>
-            </div>
-          )}
-
-          {documents.length > 0 && (
-            <div className="composer-knowledge-panel">
-              <div className="composer-knowledge-chips">
-                {documents.map(doc => (
-                  <div key={doc.name} className="knowledge-chip" title={`${doc.name} (${doc.size_formatted})`}>
-                    <FileText size={12} />
-                    <span className="knowledge-chip-name">{doc.name}</span>
-                    <button 
-                      className="knowledge-chip-remove" 
-                      onClick={() => handleDeleteDocument(doc.name)}
-                      title="Remove document"
-                    >
-                      <X size={10} />
-                    </button>
-                  </div>
-                ))}
-              </div>
-              <div className="composer-knowledge-summary">
-                <FileText size={12} />
-                <span>{documents.length} documents indexed ({totalChunks} units of knowledge)</span>
-              </div>
-            </div>
-          )}
-          
-          {uploadQueue.length > 0 && (
-
-            <div className="composer-upload-queue">
-              {uploadQueue.map(item => (
-                <div key={item.id} className={`composer-upload-item status-${item.status.toLowerCase()}`}>
-                  <div className="upload-item-info">
-                    <span className="upload-item-name">{item.name}</span>
-                    <span className="upload-item-percent">{Math.round(item.progress * 100)}%</span>
-                  </div>
-                  <div className="upload-progress-bar">
-                    <div className="upload-progress-fill" style={{ width: `${item.progress * 100}%` }} />
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
 
 
-
-          <div className="composer-box">
-            <div className="composer-upload-container">
+          {(documents.length > 0 || uploadQueue.length > 0) && (
+            <div className="composer-knowledge-badge-container">
               <button 
-                className={`composer-upload-btn ${showUploadMenu ? 'active' : ''}`} 
-                onClick={() => setShowUploadMenu(!showUploadMenu)}
-                title="Upload"
                 type="button"
+                className="composer-knowledge-badge"
+                onClick={() => setShowKnowledgePopup(!showKnowledgePopup)}
               >
-                <Plus size={16} />
+                <FileText size={12} />
+                <span>
+                  {documents.length > 0 
+                    ? `${documents.length} document${documents.length !== 1 ? 's' : ''} indexed${uploadQueue.length > 0 ? ` (${uploadQueue.length} uploading)` : ''}`
+                    : `Uploading ${uploadQueue.length} document${uploadQueue.length !== 1 ? 's' : ''}...`
+                  }
+                </span>
               </button>
               
-              {showUploadMenu && (
+              {showKnowledgePopup && (
                 <>
-                  <div className="upload-menu-overlay" onClick={() => setShowUploadMenu(false)} />
-                  <div className="composer-upload-menu">
-                    <button onClick={() => { fileInputRef.current?.click(); setShowUploadMenu(false); }}>
-                      <FileText size={16} />
-                      <span>Upload Files</span>
-                    </button>
-                    <button onClick={() => { folderInputRef.current?.click(); setShowUploadMenu(false); }}>
-                      <Folder size={16} />
-                      <span>Upload Folder</span>
-                    </button>
+                  <div className="knowledge-popup-overlay" onClick={() => setShowKnowledgePopup(false)} />
+                  <div className="composer-knowledge-popup">
+                    <div className="knowledge-popup-header">
+                      <span>Indexed Materials</span>
+                      <span className="knowledge-chunks-badge">{totalChunks} chunks</span>
+                    </div>
+                    <div className="knowledge-popup-list">
+                      {uploadQueue.map(item => {
+                        const ext  = item.name.split('.').pop().toUpperCase();
+                        const shortName = getShortDocumentName(item.name);
+                        return (
+                            <div key={item.id} title={item.name} className={`knowledge-popup-item uploading status-${item.status.toLowerCase()}`} style={{ display: 'flex', flexDirection: 'column', alignItems: 'stretch', gap: '4px' }}>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                <span className="doc-type-badge" data-ext={ext.toLowerCase()}>{ext}</span>
+                                <span className="doc-popup-name" style={{ flex: 1 }}>{shortName}</span>
+                                <span className="upload-item-percent" style={{ fontSize: '0.7rem', fontWeight: 700, color: 'var(--accent-text)' }}>
+                                  {Math.round(item.progress * 100)}%
+                                </span>
+                              </div>
+                              <div className="upload-progress-bar" style={{ height: '3px', background: 'var(--bg-input)', borderRadius: '2px', overflow: 'hidden' }}>
+                                <div className="upload-progress-fill" style={{ width: `${item.progress * 100}%`, height: '100%', background: 'linear-gradient(90deg, var(--accent), var(--accent-2))', transition: 'width 0.3s ease' }} />
+                              </div>
+                            </div>
+                          );
+                      })}
+                      {documents.map(doc => {
+                        const ext  = doc.name.split('.').pop().toUpperCase();
+                        const shortName = getShortDocumentName(doc.name);
+                        return (
+                          <div key={doc.name} title={doc.name} className="knowledge-popup-item">
+                              <span className="doc-type-badge" data-ext={ext.toLowerCase()}>{ext}</span>
+                              <span className="doc-popup-name">{shortName}</span>
+                              <button
+                                  type="button"
+                                  className="doc-popup-remove"
+                                  title="Remove"
+                                  onClick={() => handleDeleteDocument(doc.name)}
+                                >
+                                  <X size={10} />
+                                </button>
+                            </div>
+                          );
+                      })}
+                    </div>
                   </div>
                 </>
               )}
             </div>
+          )}
+
+          <div className="composer-box">
+            <button 
+                type="button" 
+                className="composer-upload-btn"
+                title="Upload study materials"
+                onClick={() => fileInputRef.current?.click()}
+              >
+                <UploadCloud size={14} />
+              </button>
+
             
             <input 
               type="file" 
               ref={fileInputRef} 
               multiple 
               hidden 
-              accept=".pdf,.docx,.doc,.pptx,.ppt,.xlsx,.xls,.txt,.md,.jpg,.jpeg,.png,.webp,.svg"
+              accept=".pdf,.docx,.doc,.pptx,.ppt,.xlsx,.xls,.txt,.md"
               onChange={(e) => {
                 if (e.target.files.length) handleFiles(e.target.files);
                 e.target.value = '';
@@ -867,18 +936,18 @@ export default function ChatArea({
                 e.target.value = '';
               }}
             />
-            {selectedChip && (
-              <div className="composer-selected-chip">
-                <span className="chip-icon">{selectedChip.icon}</span>
-                <span className="chip-label">{selectedChip.label}</span>
-                <button 
-                  className="chip-close" 
-                  onClick={() => setSelectedChip(null)}
-                  title="Remove template"
-                >
-                  <X size={10} />
-                </button>
-              </div>
+              {selectedChip && (
+                <div className="composer-selected-chip">
+                  <span className="chip-icon">{ICON_MAP[selectedChip.iconName] || <Sparkles size={16} />}</span>
+                  <span className="chip-label">{selectedChip.label}</span>
+                  <button 
+                      className="chip-close" 
+                      title="Remove template"
+                      onClick={() => setSelectedChip(null)}
+                    >
+                      <X size={10} />
+                    </button>
+                </div>
             )}
             <textarea
               ref={textareaRef}
@@ -890,14 +959,14 @@ export default function ChatArea({
               onPaste={handlePaste}
             />
             <button 
-              className="send-btn" 
-              onClick={() => handleSend()} 
-              disabled={isGenerating || (!query.trim() && !selectedChip)} 
-              title="Send"
-              onMouseEnter={handleButtonHover}
-            >
-              <Send size={15} />
-            </button>
+                className="send-btn" 
+                title="Send"
+                onClick={() => handleSend()} 
+                disabled={isGenerating || (!query.trim() && !selectedChip)} 
+                onMouseEnter={handleButtonHover}
+              >
+                <Send size={15} />
+              </button>
           </div>
         </div>
       </div>

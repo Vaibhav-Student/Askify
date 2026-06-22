@@ -1,5 +1,24 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
 import { X, FileText, Sparkles, ChevronRight, Check, ChevronDown } from './Icons';
+
+export function getShortDocumentName(filename) {
+  if (!filename) return '';
+  let base = filename.replace(/\.[^.]+$/, "");
+  base = base.replace(/^\d+[_-]/, "");
+  base = base.replace(/[_-]/g, " ").trim();
+  if (base.includes(" - ")) {
+    const parts = base.split(" - ");
+    base = parts[parts.length - 1].trim();
+  } else if (base.includes(" -")) {
+    const parts = base.split(" -");
+    base = parts[parts.length - 1].trim();
+  } else if (base.includes("- ")) {
+    const parts = base.split("- ");
+    base = parts[parts.length - 1].trim();
+  }
+  return base;
+}
 
 export default function StudyHub({
   isOpen,
@@ -206,8 +225,8 @@ export default function StudyHub({
       }
 
       // Check for list item
-      const isListItem = /^\s*[•\-\*\u2022\d+\.\u2713]/.test(trimmed);
-      const cleanLine = trimmed.replace(/^\s*[•\-\*\u2022\d+\.\u2713]\s*/, '');
+      const isListItem = /^\s*[•\-*\u2022\d+[.\])\u2713]\s/.test(trimmed);
+      const cleanLine = trimmed.replace(/^\s*[•\-*\u2022\d+[.\])\u2713]\s*/, '');
 
       if (isListItem) {
         if (currentBlock && currentBlock.type !== 'ul') {
@@ -221,9 +240,10 @@ export default function StudyHub({
         continue;
       }
 
-      // Check for heading (short line, no ending punctuation, starts with capital/digit)
-      const isHeading = trimmed.length < 65 && !trimmed.endsWith('.') && !trimmed.endsWith(',') &&
-                        (trimmed === trimmed.toUpperCase() || /^[A-Z0-9]/.test(trimmed));
+      // Check for heading (ALL-CAPS short line or numbered/keyword heading)
+      const isHeading = (trimmed.length < 50 && trimmed === trimmed.toUpperCase() && /[A-Z]{2,}/.test(trimmed)) ||
+                        /^\d+[\.\)]\s+[A-Z]/.test(trimmed) ||
+                        /^(Chapter|Section|Part|Unit|Topic|Lesson|Module|Chapter)\b/i.test(trimmed);
 
       if (isHeading) {
         if (currentBlock) {
@@ -231,6 +251,19 @@ export default function StudyHub({
           currentBlock = null;
         }
         blocks.push({ type: 'h3', text: trimmed });
+        continue;
+      }
+
+      // Check for subheading (ends with colon and is short, or starts with bold marker)
+      const isSubheading = (trimmed.length < 80 && trimmed.endsWith(':') && !trimmed.endsWith('::')) ||
+                           /^\*\*[^*]+\*\*\s*$/.test(trimmed);
+
+      if (isSubheading) {
+        if (currentBlock) {
+          blocks.push(currentBlock);
+          currentBlock = null;
+        }
+        blocks.push({ type: 'h4', text: trimmed.replace(/^\*\*|\*\*$/g, '') });
         continue;
       }
 
@@ -243,7 +276,6 @@ export default function StudyHub({
       if (!currentBlock) {
         currentBlock = { type: 'p', text: trimmed };
       } else {
-        // If the previous line ended with a sentence terminator, start a new paragraph block
         const lastChar = currentBlock.text.trim().slice(-1);
         if (['.', '?', '!', ':'].includes(lastChar)) {
           blocks.push(currentBlock);
@@ -263,6 +295,9 @@ export default function StudyHub({
         {blocks.map((block, idx) => {
           if (block.type === 'h3') {
             return <h3 key={idx} className="viewer-heading">{highlightBlock(block.text)}</h3>;
+          }
+          if (block.type === 'h4') {
+            return <h4 key={idx} className="viewer-subheading">{highlightBlock(block.text)}</h4>;
           }
           if (block.type === 'ul') {
             return (
@@ -288,7 +323,7 @@ export default function StudyHub({
             <Sparkles size={16} className="title-icon glow-purple" />
             <span>Study Hub</span>
           </div>
-          <button className="sh-close-btn" onClick={onClose} title="Close Study Hub">
+          <button className="sh-close-btn" title="Close Study Hub" onClick={onClose}>
             <X size={16} />
           </button>
         </div>
@@ -393,10 +428,18 @@ export default function StudyHub({
           )}
 
           {!loading && selectedDoc && (
-            <>
+            <AnimatePresence mode="wait">
               {/* Tab 1: Document Viewer */}
               {activeTab === 'viewer' && !error && (
-                <div className="sh-tab-viewer" ref={viewerRef}>
+                <motion.div
+                  key="viewer"
+                  initial={{ opacity: 0, y: 12 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -8 }}
+                  transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
+                  className="sh-tab-viewer"
+                  ref={viewerRef}
+                >
                   <div className="viewer-header">
                     <h4>{selectedDoc}</h4>
                     {activeDocForViewer?.highlightText && (
@@ -404,12 +447,19 @@ export default function StudyHub({
                     )}
                   </div>
                   <div className="viewer-text">{renderHighlightedContent()}</div>
-                </div>
+                </motion.div>
               )}
 
               {/* Tab 2: Flashcards */}
               {activeTab === 'flashcards' && (
-                <div className="sh-tab-flashcards">
+                <motion.div
+                  key="flashcards"
+                  initial={{ opacity: 0, y: 12 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -8 }}
+                  transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
+                  className="sh-tab-flashcards"
+                >
                   {flashcards.length === 0 ? (
                     <div className="tab-actions-card">
                       <p>Generate study flashcards from the key concepts of your document.</p>
@@ -446,12 +496,19 @@ export default function StudyHub({
                       </div>
                     </div>
                   )}
-                </div>
+                </motion.div>
               )}
 
               {/* Tab 3: Quiz Mode */}
               {activeTab === 'quiz' && (
-                <div className="sh-tab-quiz">
+                <motion.div
+                  key="quiz"
+                  initial={{ opacity: 0, y: 12 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -8 }}
+                  transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
+                  className="sh-tab-quiz"
+                >
                   {quiz.length === 0 ? (
                     <div className="tab-actions-card">
                       <p>Test your knowledge with 5 multiple-choice questions from this document.</p>
@@ -514,12 +571,19 @@ export default function StudyHub({
                       )}
                     </div>
                   )}
-                </div>
+                </motion.div>
               )}
 
               {/* Tab 4: Study Roadmap */}
               {activeTab === 'roadmap' && (
-                <div className="sh-tab-roadmap">
+                <motion.div
+                  key="roadmap"
+                  initial={{ opacity: 0, y: 12 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -8 }}
+                  transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
+                  className="sh-tab-roadmap"
+                >
                   {roadmap.length === 0 ? (
                     <div className="tab-actions-card">
                       <p>Generate a structured study roadmap with actionable tasks for this syllabus.</p>
@@ -571,9 +635,9 @@ export default function StudyHub({
                       </div>
                     </div>
                   )}
-                </div>
+                </motion.div>
               )}
-            </>
+            </AnimatePresence>
           )}
         </div>
       </aside>

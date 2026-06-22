@@ -20,22 +20,26 @@ logger = logging.getLogger(__name__)
 ACTION_REGEX = re.compile(r"Action:\s*(\w+)\((.*)\)", re.IGNORECASE)
 
 # ── Agent System Prompt ──────────────────────────────────────────────────────
+ 
+AGENT_SYSTEM_PROMPT = """You are a Premium AI Academic Assistant. Goal: Solve academic queries with extreme accuracy, PROFESSIONAL formatting, and high SPEED.
+To meet strict time budgets (4-6 seconds), execute at most 1 tool call and output the Final Answer immediately.
 
-AGENT_SYSTEM_PROMPT = """You are a Premium AI Academic Assistant. Goal: Solve academic queries with accuracy and SPEED.
-To meet time budgets, execute at most 1 tool call and output the Answer immediately in the next step.
-
-Tools:
-1. `search_knowledge_base(query)`: Searches documents. Input: query (str). Output: relevant text.
-2. `get_document_list()`: Lists uploaded documents. Input: none.
-3. `delete_document(filename)`: Deletes document. Input: filename (str).
+Formatting Rules:
+1. Use a professional, academic tone.
+2. Use **Bold Text** for headings and key concepts.
+3. Use bullet points for lists and numbered lists for steps.
+4. Break long responses into clear, concise paragraphs with blank lines.
+5. Never use "#" or "##" headers; use **Bold Headings** instead.
+6. Ensure the answer is comprehensive yet direct.
 
 ReAct Format:
-Thought: <reasoning>
+Thought: <brief reasoning>
 Action: <tool_name>(<arg>)
 OR:
-Thought: <reasoning>
-Answer: <final structured markdown response. Never use "#"/"##" headers; use **bold text** for headings. Break paragraphs with blank lines.>
+Thought: <brief reasoning>
+Answer: <final professional structured response following the formatting rules above>
 """
+
 
 # ── Tool Layer Definitions ───────────────────────────────────────────────────
 
@@ -278,8 +282,7 @@ class ReActAgent:
             # Stream the LLM response for this step
             try:
                 stream = self.llm.stream(messages)
-                for chunk in stream:
-                    token = chunk.content
+                for token in stream:
                     current_step_text += token
                     
                     # Check if the LLM output transitioned to providing the final Answer
@@ -338,9 +341,8 @@ class ReActAgent:
         
         fallback_prompt = self._compile_fallback_prompt(query, run_history)
         try:
-            stream = self.llm.stream(fallback_prompt)
-            for chunk in stream:
-                yield f"data: {json.dumps({'token': chunk.content})}\n\n"
+            for token in self.llm.stream(fallback_prompt):
+                yield f"data: {json.dumps({'token': token})}\n\n"
         except Exception as e:
             yield f"data: {json.dumps({'error': f'LLM Fallback Generation Error: {str(e)}'})}\n\n"
             

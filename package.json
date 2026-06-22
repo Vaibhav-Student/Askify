@@ -1,0 +1,12 @@
+{
+  "name": "askify",
+  "private": true,
+  "scripts": {
+    "dev:all": "concurrently -n backend,frontend -c blue,green \"python app_api.py\" \"cd frontend && npm run dev\"",
+    "install:all": "cd frontend && npm install",
+    "build": "cd frontend && npm run build"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}

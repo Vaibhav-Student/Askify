@@ -53,11 +53,11 @@ export default function ApiKeyInput({ toolId, toolName, onSave, showNotification
                     />
                     <button
                         className="key-toggle"
-                        onClick={() => setShowKey(!showKey)}
                         title={showKey ? "Hide Key" : "Show Key"}
-                    >
+                        onClick={() => setShowKey(!showKey)}
+                      >
                         {showKey ? <EyeOff size={14} /> : <Eye size={14} />}
-                    </button>
+                      </button>
                 </div>
                 
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginTop: '4px' }}>

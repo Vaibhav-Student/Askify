@@ -2,7 +2,6 @@ import { AI_TOOLS } from '../config/toolsData';
 
 export default function ModelSelector({ selectedToolId, selectedModelId, onModelChange }) {
     const activeTool = AI_TOOLS.find(t => t.id === selectedToolId) || AI_TOOLS[0];
-    const activeModel = activeTool.models.find(m => m.id === selectedModelId);
 
     return (
         <div className="selector-container" style={{ marginTop: '14px' }}>

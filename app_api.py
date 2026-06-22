@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, send_from_directory
 from werkzeug.utils import secure_filename
 import json
 import io
@@ -7,23 +7,23 @@ import uuid
 import os
 import shutil
 import time
+import warnings
 
-# from document_loader import load_multiple_pdfs, load_pptx, load_xlsx
-# from vector_store import create_vector_store
-# from rag_engine import RAGEngine
-
+warnings.filterwarnings("ignore", category=UserWarning, module="langchain_nvidia_ai_endpoints")
 
 import threading
 
-app = Flask(__name__)
+from config import CHAT_MODEL, STUDY_MODEL, ALLOWED_MODELS, NVIDIA_API_KEY
+
+STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static_react')
+app = Flask(__name__, static_folder=STATIC_DIR, static_url_path='')
 
 # ── Configuration ──
 MAX_UPLOAD_SIZE = 500 * 1024 * 1024  # 500 MB
 MAX_CHUNK_SIZE = 5 * 1024 * 1024     # 5 MB
 CHUNK_DIR = os.path.join("data", "uploads", "chunks")
 ALLOWED_EXTENSIONS = {
-    "pdf", "docx", "doc", "pptx", "ppt", "xlsx", "xls", "txt", "md",
-    "jpg", "jpeg", "png", "webp", "svg"
+    "pdf", "docx", "doc", "pptx", "ppt", "xlsx", "xls", "txt", "md"
 }
 RATE_LIMIT_WINDOW = 60   # seconds
 RATE_LIMIT_MAX = 30      # max chunk uploads per window per IP
@@ -47,9 +47,8 @@ def rebuild_vector_store():
     from vector_store import create_vector_store
     with vs_lock:
         try:
-            all_text = "\n\n".join([doc["text"] for doc in GLOBAL_STATE["documents"]])
-            if all_text.strip():
-                GLOBAL_STATE["vector_store"] = create_vector_store(all_text)
+            if GLOBAL_STATE["documents"]:
+                GLOBAL_STATE["vector_store"] = create_vector_store(GLOBAL_STATE["documents"])
             else:
                 GLOBAL_STATE["vector_store"] = None
         except Exception as e:
@@ -62,9 +61,7 @@ def handle_exception(e):
     app.logger.error(f"[Unhandled Error] {e}", exc_info=True)
     return jsonify({"error": "Internal Server Error", "details": str(e)}), 500
 
-@app.route("/api/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok"})
+
 
 @app.route("/api/api-key", methods=["GET", "POST"])
 def api_key_route():
@@ -88,50 +85,12 @@ def upload():
         filename = "uploaded_file"
 
     try:
-        from document_loader import load_multiple_pdfs, load_pptx, load_xlsx
-        ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
-        text = ""
-
-        if ext == 'pdf':
-            file_bytes = file.read()
-            if not file_bytes:
-                return jsonify({"error": "Uploaded file is empty"}), 400
-            pdf_stream = io.BytesIO(file_bytes)
-            try:
-                text = load_multiple_pdfs([pdf_stream])
-            except Exception as pdf_err:
-                app.logger.error(f"[PDF Parse Error] {pdf_err}", exc_info=True)
-                return jsonify({"error": f"Failed to parse PDF: {pdf_err}"}), 400
-        elif ext in ['pptx', 'ppt']:
-            file_bytes = file.read()
-            if not file_bytes:
-                return jsonify({"error": "Uploaded file is empty"}), 400
-            file_stream = io.BytesIO(file_bytes)
-            try:
-                text = load_pptx(file_stream)
-            except Exception as ppt_err:
-                app.logger.error(f"[PPT Parse Error] {ppt_err}", exc_info=True)
-                return jsonify({"error": f"Failed to parse PowerPoint: {ppt_err}"}), 400
-        elif ext in ['xlsx', 'xls']:
-            file_stream = io.BytesIO(file.read())
-            try:
-                text = load_xlsx(file_stream)
-            except Exception as xls_err:
-                app.logger.error(f"[Excel Parse Error] {xls_err}", exc_info=True)
-                return jsonify({"error": f"Failed to parse Excel: {xls_err}"}), 400
-        else:
-            # Fallback for all other file types: Try to read as text, otherwise register as non-indexable
-            raw = file.read()
-            if not raw:
-                return jsonify({"error": "Uploaded file is empty"}), 400
-            try:
-                text = raw.decode('utf-8')
-            except (UnicodeDecodeError, Exception):
-                try:
-                    text = raw.decode('latin-1')
-                except Exception:
-                    # If it's binary or can't be decoded, we still register it
-                    text = f"[Binary/Non-text content for {filename}]"
+        from document_loader import extract_text_and_pages
+        file_bytes = file.read()
+        if not file_bytes:
+            return jsonify({"error": "Uploaded file is empty"}), 400
+            
+        text, pages = extract_text_and_pages(file_bytes, filename)
 
         if not text.strip():
             return jsonify({"error": "Could not extract text from the file (might be empty or scanned)"}), 400
@@ -142,6 +101,7 @@ def upload():
         GLOBAL_STATE["documents"].append({
             "name": filename,
             "text": text,
+            "pages": pages,
             "chunks": chunks_estimate,
             "size": len(text)
         })
@@ -181,33 +141,15 @@ def _validate_extension(filename):
 
 
 def _process_assembled_file(filepath, filename):
-    """Extract text from an assembled file, reusing existing loader logic."""
-    from document_loader import load_multiple_pdfs, load_pptx, load_xlsx
-    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-    text = ""
-
+    """Extract text and pages from an assembled file, reusing existing loader logic."""
+    from document_loader import extract_text_and_pages
     with open(filepath, "rb") as fh:
         raw = fh.read()
 
     if not raw:
         raise ValueError("Assembled file is empty")
 
-    if ext == "pdf":
-        text = load_multiple_pdfs([io.BytesIO(raw)])
-    elif ext in ("pptx", "ppt"):
-        text = load_pptx(io.BytesIO(raw))
-    elif ext in ("xlsx", "xls"):
-        text = load_xlsx(io.BytesIO(raw))
-    else:
-        try:
-            text = raw.decode("utf-8")
-        except (UnicodeDecodeError, Exception):
-            try:
-                text = raw.decode("latin-1")
-            except Exception:
-                text = f"[Binary/Non-text content for {filename}]"
-
-    return text
+    return extract_text_and_pages(raw, filename)
 
 
 def _purge_stale_sessions():
@@ -241,7 +183,7 @@ def upload_init():
 
     if not _validate_extension(safe_name):
         return jsonify({
-            "error": f"File type not allowed. Supported: {', '.join(sorted(ALLOWED_EXTENSIONS))} (Text & Images only)"
+            "error": f"File type not allowed. Supported: {', '.join(sorted(ALLOWED_EXTENSIONS))} (Text documents only — no images)"
         }), 400
 
     if total_size > MAX_UPLOAD_SIZE:
@@ -351,7 +293,7 @@ def upload_finalize():
                 with open(chunk_path, "rb") as cp:
                     out.write(cp.read())
 
-        text = _process_assembled_file(assembled_path, session["filename"])
+        text, pages = _process_assembled_file(assembled_path, session["filename"])
 
         if not text.strip():
             shutil.rmtree(session_dir, ignore_errors=True)
@@ -367,6 +309,7 @@ def upload_finalize():
         GLOBAL_STATE["documents"].append({
             "name": filename,
             "text": text,
+            "pages": pages,
             "chunks": chunks_estimate,
             "size": len(text),
         })
@@ -483,17 +426,13 @@ def prewarm():
 
     def run_prewarm():
         try:
-            from rag_engine import RAGEngine, select_model_for_query
-            selected_model = select_model_for_query(query)
+            from rag_engine import RAGEngine
             engine = RAGEngine(
                 GLOBAL_STATE["vector_store"],
-                provider="nvidia",
-                model_name=selected_model,
-                api_key=""
+                model_name=CHAT_MODEL,
             )
             if engine.vector_store:
                 retriever = engine.vector_store.as_retriever(top_k=5)
-                # Perform the vector database similarity search early
                 docs = retriever.invoke(query)
                 GLOBAL_STATE["prewarm_cache"][query.lower()] = docs
         except Exception as e:
@@ -512,8 +451,8 @@ def chat():
         return jsonify({"error": "Query cannot be empty"}), 400
 
     provider = "nvidia"
-    model = "google/gemma-3n-e4b-it"
-    api_key = ""
+    model = CHAT_MODEL
+    api_key = NVIDIA_API_KEY
 
     prewarmed_docs = None
     q_lower = query.lower()
@@ -525,19 +464,26 @@ def chat():
             break
 
     try:
+        # Ensure engine exists, create on-demand if warmup hasn't completed
         engine = GLOBAL_STATE.get("chat_engine")
         if not engine or not engine.llm:
-            from rag_engine import RAGEngine
-            engine = RAGEngine(
-                GLOBAL_STATE["vector_store"],
-                provider=provider,
-                model_name=model,
-                api_key=api_key
-            )
-            GLOBAL_STATE["chat_engine"] = engine
+            # Brief wait for warmup to complete (max 2 seconds)
+            import time
+            for _ in range(20):
+                engine = GLOBAL_STATE.get("chat_engine")
+                if engine and engine.llm:
+                    break
+                time.sleep(0.1)
+            # If still not ready, create on-demand
+            if not engine or not engine.llm:
+                from rag_engine import RAGEngine
+                engine = RAGEngine(
+                    GLOBAL_STATE["vector_store"],
+                    model_name=model,
+                )
+                GLOBAL_STATE["chat_engine"] = engine
         else:
             engine.vector_store = GLOBAL_STATE["vector_store"]
-            engine.api_key = api_key
 
         def generate():
             try:
@@ -590,17 +536,17 @@ def generate_study_materials():
     if not doc_text:
         return jsonify({"error": "No indexed documents found. Please upload a file first."}), 400
         
-    sample_text = doc_text[:10000]
+    sample_text = doc_text[:4000]
     
     if material_type == "flashcards":
         prompt = (
-            f"Based on the following text, generate exactly 6 high-quality flashcards. "
+            f"Based on the following text, generate exactly 4 high-quality flashcards. "
             f"Format the output strictly as a minified JSON array of objects, where each object has 'question' and 'answer' fields. "
             f"Do not include markdown formatting, markdown wrappers, backticks, or any other explanations. Return ONLY the raw valid JSON.\n\nText:\n{sample_text}"
         )
     elif material_type == "quiz":
         prompt = (
-            f"Based on the following text, generate exactly 5 multiple-choice questions. "
+            f"Based on the following text, generate exactly 3 multiple-choice questions. "
             f"Format the output strictly as a minified JSON array of objects, where each object has "
             f"'question', 'options' (an array of 4 string options), 'correctIndex' (0-indexed integer of the correct option), "
             f"and 'explanation' (why it is correct) fields. "
@@ -608,7 +554,7 @@ def generate_study_materials():
         )
     elif material_type == "roadmap":
         prompt = (
-            f"Based on the following text, generate an academic study roadmap with exactly 4 milestones. "
+            f"Based on the following text, generate an academic study roadmap with exactly 3 milestones. "
             f"Format the output strictly as a minified JSON array of objects, where each object has "
             f"'title' (milestone title), 'description' (what to learn), and 'tasks' (an array of 3 specific action tasks) fields. "
             f"Do not include markdown formatting, markdown wrappers, backticks, or any other explanations. Return ONLY the raw valid JSON.\n\nText:\n{sample_text}"
@@ -616,13 +562,74 @@ def generate_study_materials():
     else:
         return jsonify({"error": "Invalid material type"}), 400
 
+    def build_local_study_materials():
+        import re
+
+        sentences = [
+            re.sub(r"\s+", " ", s).strip()
+            for s in re.split(r"(?<=[.!?])\s+|\n+", sample_text)
+            if len(re.sub(r"\s+", " ", s).strip()) > 35
+        ]
+        if not sentences:
+            sentences = [re.sub(r"\s+", " ", sample_text).strip() or "Review the uploaded document."]
+
+        def short(text, limit=180):
+            return text if len(text) <= limit else text[:limit].rsplit(" ", 1)[0] + "..."
+
+        if material_type == "flashcards":
+            cards = []
+            for idx, sentence in enumerate((sentences * 4)[:4], start=1):
+                cards.append({
+                    "question": f"What is key point {idx} from this document?",
+                    "answer": short(sentence, 220),
+                })
+            return cards
+
+        if material_type == "quiz":
+            quiz_items = []
+            for idx, sentence in enumerate((sentences * 3)[:3], start=1):
+                quiz_items.append({
+                    "question": f"Which statement best matches key point {idx}?",
+                    "options": [
+                        short(sentence, 160),
+                        "This topic is unrelated to the uploaded material.",
+                        "The document does not discuss this concept.",
+                        "This point should be ignored during revision.",
+                    ],
+                    "correctIndex": 0,
+                    "explanation": "This option is taken from the indexed document text.",
+                })
+            return quiz_items
+
+        milestones = []
+        for idx, sentence in enumerate((sentences * 3)[:3], start=1):
+            milestones.append({
+                "title": f"Milestone {idx}",
+                "description": short(sentence, 180),
+                "tasks": [
+                    "Read the related section carefully.",
+                    "Write short notes in your own words.",
+                    "Practice two questions from this concept.",
+                ],
+            })
+        return milestones
+
     try:
         engine = GLOBAL_STATE.get("study_engine")
         if not engine or not engine.llm:
-            from rag_engine import RAGEngine
-            engine = RAGEngine(None, provider="nvidia", model_name="google/gemma-3n-e4b-it")
-            GLOBAL_STATE["study_engine"] = engine
-            
+            # Brief wait for warmup to complete (max 2 seconds)
+            import time
+            for _ in range(20):
+                engine = GLOBAL_STATE.get("study_engine")
+                if engine and engine.llm:
+                    break
+                time.sleep(0.1)
+            # If still not ready, create on-demand
+            if not engine or not engine.llm:
+                from rag_engine import RAGEngine
+                engine = RAGEngine(None, model_name=STUDY_MODEL)
+                GLOBAL_STATE["study_engine"] = engine
+        
         if not engine.llm:
             return jsonify({"error": "LLM not initialized"}), 500
             
@@ -632,60 +639,125 @@ def generate_study_materials():
             HumanMessage(content=prompt)
         ]
         
-        # Optimize speed by binding appropriate max_tokens constraints
-        model = engine.llm
-        if material_type == "flashcards":
-            bound_llm = model.bind(max_tokens=250)
-        elif material_type == "quiz":
-            bound_llm = model.bind(max_tokens=400)
-        elif material_type == "roadmap":
-            bound_llm = model.bind(max_tokens=500)
-        else:
-            bound_llm = model
-            
-        response = bound_llm.invoke(messages)
+        try:
+            response = engine.llm.invoke(messages)
+        except Exception as invoke_err:
+            app.logger.warning(f"[Study Gen Warning] Primary model invocation failed: {invoke_err}. Using local materials.")
+            return jsonify({"data": build_local_study_materials(), "fallback": True})
+
         content = response.content.strip()
         
-        if content.startswith("```json"):
-            content = content.split("```json", 1)[1]
-        if content.startswith("```"):
-            content = content.split("```", 1)[1]
-        if content.endswith("```"):
-            content = content.rsplit("```", 1)[0]
-        content = content.strip()
-        
-        parsed_json = json.loads(content)
+        # Robust extract and parse JSON helper
+        def extract_and_parse_json(text):
+            import re
+            text = text.strip()
+            
+            # Remove markdown code blocks if present
+            match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
+            if match:
+                candidate = match.group(1).strip()
+            else:
+                candidate = text
+                
+            # Locate actual JSON structure
+            first_idx = min([candidate.find(c) for c in ['[', '{'] if candidate.find(c) != -1], default=-1)
+            last_idx = max([candidate.rfind(c) for c in [']', '}'] if candidate.rfind(c) != -1], default=-1)
+            
+            if first_idx != -1 and last_idx != -1 and first_idx < last_idx:
+                candidate = candidate[first_idx:last_idx+1]
+                
+            candidate = candidate.strip()
+            
+            # Auto-close truncated JSON
+            if candidate.startswith('[') and not candidate.endswith(']'):
+                last_obj_end = candidate.rfind('}')
+                if last_obj_end != -1:
+                    candidate = candidate[:last_obj_end+1] + ']'
+                else:
+                    candidate += ']'
+            elif candidate.startswith('{') and not candidate.endswith('}'):
+                candidate += '}'
+                
+            # Clean trailing commas
+            candidate = re.sub(r',\s*([\]}])', r'\1', candidate)
+            
+            try:
+                return json.loads(candidate)
+            except Exception as e:
+                try:
+                    return json.loads(text)
+                except Exception:
+                    raise e
+
+        try:
+            parsed_json = extract_and_parse_json(content)
+        except Exception as parse_err:
+            app.logger.warning(f"[Study Gen Warning] Could not parse model JSON: {parse_err}. Using local generated materials.")
+            parsed_json = build_local_study_materials()
         return jsonify({"data": parsed_json})
         
     except Exception as e:
         app.logger.error(f"[Study Gen Error] {e}", exc_info=True)
-        return jsonify({"error": f"Failed to generate study materials: {str(e)}"}), 500
+        return jsonify({"data": build_local_study_materials(), "fallback": True})
 
 
 def warmup_app():
-    # 1. Warm up HuggingFace embeddings (SentenceTransformer)
-    try:
-        print("[Warmup] Starting background eager model loading...", flush=True)
-        from vector_store import get_embeddings
-        get_embeddings()
-        print("[Warmup] Embedding model loaded and cached successfully.", flush=True)
-    except Exception as e:
-        print(f"[Warmup Warning] Embedding warmup encountered an error: {e}", flush=True)
-        
-    # 2. Warm up Gemma (DNS, TCP, SSL, and Nvidia session)
+    print("[Warmup] Skipping eager embedding load. Model will load lazily.", flush=True)
+
+    # 2. Warm up Chat Engine
     try:
         from rag_engine import RAGEngine
-        engine = RAGEngine(None, provider="nvidia", model_name="google/gemma-3n-e4b-it")
-        if engine.llm:
-            print("[Warmup] Sending a tiny test prompt to Gemma to warm up connection...", flush=True)
-            engine.llm.invoke("Hi", max_tokens=1)
-            GLOBAL_STATE["study_engine"] = engine
-            print("[Warmup] Gemma client initialized, warmed, and TCP/SSL handshakes established. Stored in GLOBAL_STATE.", flush=True)
+        engine_chat = RAGEngine(None, model_name=CHAT_MODEL)
+        GLOBAL_STATE["chat_engine"] = engine_chat
+        print(f"[Warmup] Chat: {CHAT_MODEL} initialized.", flush=True)
     except Exception as e:
-        print(f"[Warmup Warning] Gemma warmup encountered an error: {e}", flush=True)
+        print(f"[Warmup] Chat {CHAT_MODEL} failed: {e}", flush=True)
+
+    # 3. Warm up Study Engine
+    try:
+        from rag_engine import RAGEngine
+        engine_study = RAGEngine(None, model_name=STUDY_MODEL)
+        GLOBAL_STATE["study_engine"] = engine_study
+        print(f"[Warmup] Study: {STUDY_MODEL} initialized.", flush=True)
+    except Exception as e:
+        print(f"[Warmup] Study {STUDY_MODEL} failed: {e}", flush=True)
+
+    GLOBAL_STATE["warmup_complete"] = True
+    print("[Warmup] Complete.", flush=True)
+
+
+@app.route("/api/health", methods=["GET"])
+def health_check():
+    """Health/readiness check for frontend to know when backend is ready."""
+    warmup_done = GLOBAL_STATE.get("warmup_complete", False)
+    chat_ready = GLOBAL_STATE.get("chat_engine") is not None
+    study_ready = GLOBAL_STATE.get("study_engine") is not None
+    return jsonify({
+        "status": "ready" if warmup_done else "warming_up",
+        "warmup_complete": warmup_done,
+        "chat_engine_ready": chat_ready,
+        "study_engine_ready": study_ready,
+    })
+
+@app.route('/', defaults={'path': ''})
+@app.route('/<path:path>')
+def serve_frontend(path):
+    """Serve the React SPA; fall back to index.html for client-side routing."""
+    target = os.path.join(STATIC_DIR, path)
+    if path and os.path.isfile(target):
+        return send_from_directory(STATIC_DIR, path)
+    return send_from_directory(STATIC_DIR, 'index.html')
+
 
 if __name__ == "__main__":
-    # Warm up all models and connections synchronously before starting the web server
-    warmup_app()
-    app.run(host="0.0.0.0", port=7860, debug=True, use_reloader=False)
-
+    threading.Thread(target=warmup_app, daemon=True).start()
+    port = int(os.environ.get("PORT", 7860))
+    print(f"\n{'='*60}")
+    print(f"🚀  ASKIFY RUNNING")
+    print(f"{'='*60}")
+    print(f"📡 Backend API:     http://127.0.0.1:{port}")
+    print(f"🌐 Frontend (dev):  http://127.0.0.1:5174  (Vite + HMR)")
+    print(f"🌐 Frontend (prod): http://127.0.0.1:{port}     (Flask static)")
+    print(f"💚 Health Check:    http://127.0.0.1:{port}/api/health")
+    print(f"{'='*60}\n")
+    app.run(host="0.0.0.0", port=port, debug=True, use_reloader=False)

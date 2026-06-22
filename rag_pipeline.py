@@ -1,8 +1,9 @@
-from langchain_groq import ChatGroq
+from langchain_nvidia_ai_endpoints import ChatNVIDIA
 from langchain_core.prompts import ChatPromptTemplate
+from config import NVIDIA_API_KEY, ALLOWED_MODELS
 
 
-def generate_answer(query, retrieved_docs, groq_api_key):
+def generate_answer(query, retrieved_docs, nvidia_api_key=None):
 
     context = "\n\n".join([doc.page_content for doc in retrieved_docs])
 
@@ -25,9 +26,10 @@ Answer format:
 5. Conclusion
 """)
 
-    llm = ChatGroq(
-        groq_api_key=groq_api_key,
-        model_name="llama-3.1-8b-instant",  # ✅ Updated model
+    key_to_use = nvidia_api_key if nvidia_api_key else NVIDIA_API_KEY
+    llm = ChatNVIDIA(
+        api_key=key_to_use,
+        model=ALLOWED_MODELS[0],
         temperature=0.3
     )
 

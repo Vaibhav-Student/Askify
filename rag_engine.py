@@ -1,176 +1,219 @@
 """
-RAG Engine Module
-Multi-provider LangChain RAG with streaming support.
-Supports: Groq, OpenAI, Gemini, Anthropic, Mistral, DeepSeek.
+rag_engine.py — NVIDIA-Exclusive RAG Engine
+
+⚠️  MODEL LOCK — DO NOT MODIFY
+    CHAT_MODEL  : minimaxai/minimax-m3   (Chat feature)
+    STUDY_MODEL : google/gemma-4-31b-it  (Study Hub feature)
 """
 
 import os
 import json
-from dotenv import load_dotenv
+import time
+import queue
+import threading
+import warnings
+import re
 
-from langchain.chains import create_history_aware_retriever, create_retrieval_chain
-from langchain.chains.combine_documents import create_stuff_documents_chain
+from dotenv import load_dotenv
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain.chains import create_history_aware_retriever, create_retrieval_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
 
-
+warnings.filterwarnings("ignore", category=UserWarning, module="langchain_nvidia_ai_endpoints")
 load_dotenv()
 
-SYSTEM_PROMPT = """You are a high-speed, low-latency AI API backend. Keep response strictly under 80 tokens. Output minified JSON only. Do NOT use markdown code blocks."""
+from config import NVIDIA_API_KEY, CHAT_MODEL, STUDY_MODEL, ALLOWED_MODELS, TEMPERATURE, MAX_TOKENS
+from sanitizer import sanitize_text, sanitize_document
+
+SYSTEM_PROMPT = """You are Askify, a concise academic assistant. Answer only what is asked — no fluff, no pleasantries.
+
+RULES:
+1. Answer exactly what was asked.
+2. If academic documents are provided, blend document facts with your general knowledge.
+3. If no documents, answer from general knowledge immediately.
+4. Use **Bold Headings**, bullets, numbered lists. No markdown headers (#).
+5. Respond in English only.
+
+FORMAT:
+**Direct Answer** — 1-2 sentences
+**Detailed Explanation** — bullet points with specifics
+**Key Takeaways** — brief summary"""
 
 
-def _create_llm(provider: str, model_name: str, api_key: str):
-    """Factory function to create the correct LangChain LLM based on provider."""
-    common_kwargs = {
-        "temperature": 0.3,
-        "max_tokens": 1024,
-        "streaming": True,
-        "timeout": 30.0,
-    }
+class _NvidiaLLM:
+    """Bulletproof NVIDIA LLM wrapper with multi-tier fallback."""
 
-    if provider == "groq":
-        from langchain_groq import ChatGroq
-        return ChatGroq(api_key=api_key, model_name=model_name, **common_kwargs)
+    _MODELS_TO_TRY = None  # Set at class level after config loads
 
-    elif provider == "openai":
-        from langchain_openai import ChatOpenAI
-        return ChatOpenAI(api_key=api_key, model=model_name, **common_kwargs)
+    def __init__(self, model_name: str):
+        self.model_name = model_name if model_name in ALLOWED_MODELS else CHAT_MODEL
 
-    elif provider == "gemini":
-        from langchain_google_genai import ChatGoogleGenerativeAI
-        return ChatGoogleGenerativeAI(
-            google_api_key=api_key,
-            model=model_name,
-            temperature=common_kwargs["temperature"],
-            max_output_tokens=common_kwargs["max_tokens"],
-            streaming=True,
+    @staticmethod
+    def _build_messages(messages):
+        return [
+            {
+                "role": "system" if isinstance(m, SystemMessage)
+                    else "assistant" if isinstance(m, AIMessage) else "user",
+                "content": sanitize_text(str(m.content)),
+            }
+            for m in messages
+        ]
+
+    @staticmethod
+    def _post_nvidia(model, payload, stream=False, timeout_read=60.0):
+        import requests
+        s = requests.Session()
+        s.trust_env = False
+        resp = s.post(
+            "https://integrate.api.nvidia.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {NVIDIA_API_KEY}",
+                "Content-Type": "application/json",
+                "Accept": "text/event-stream" if stream else "application/json",
+            },
+            json=payload,
+            timeout=(10.0, timeout_read),
+            stream=stream,
         )
+        resp.raise_for_status()
+        return resp
 
-    elif provider == "anthropic":
-        from langchain_anthropic import ChatAnthropic
-        return ChatAnthropic(
-            anthropic_api_key=api_key,
-            model_name=model_name,
-            temperature=common_kwargs["temperature"],
-            max_tokens=common_kwargs["max_tokens"],
-            streaming=True,
-        )
+    def _non_stream_call(self, model, messages):
+        payload = {
+            "model": model,
+            "messages": self._build_messages(messages),
+            "temperature": TEMPERATURE,
+            "max_tokens": min(MAX_TOKENS, 2048),
+            "top_p": 0.9,
+            "stream": False,
+        }
+        try:
+            resp = self._post_nvidia(model, payload, stream=False, timeout_read=60.0)
+            data = resp.json()
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            if not content:
+                raise RuntimeError(f"Empty content from {model}")
+            return content
+        except Exception as e:
+            err_str = str(e)
+            if "Cannot read" in err_str or "image" in err_str.lower():
+                raise RuntimeError("text contains image-like content not supported by this model")
+            raise
 
-    elif provider == "mistral":
-        from langchain_mistralai import ChatMistralAI
-        return ChatMistralAI(
-            api_key=api_key,
-            model=model_name,
-            temperature=common_kwargs["temperature"],
-            max_tokens=common_kwargs["max_tokens"],
-            streaming=True,
-        )
+    def _stream_call(self, model, messages):
+        payload = {
+            "model": model,
+            "messages": self._build_messages(messages),
+            "temperature": TEMPERATURE,
+            "max_tokens": min(MAX_TOKENS, 2048),
+            "top_p": 0.9,
+            "stream": True,
+        }
+        try:
+            resp = self._post_nvidia(model, payload, stream=True, timeout_read=120.0)
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line or not line.startswith("data: "):
+                    continue
+                raw = line[6:].strip()
+                if raw == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(raw)
+                    if "error" in chunk:
+                        raise RuntimeError(chunk["error"])
+                    token = chunk.get("choices", [{}])[0].get("delta", {}).get("content")
+                    if token:
+                        yield token
+                except (json.JSONDecodeError, KeyError, IndexError):
+                    continue
+        except Exception as e:
+            err_str = str(e)
+            if "Cannot read" in err_str or "image" in err_str.lower():
+                raise RuntimeError("text contains image-like content not supported by this model")
+            raise
 
-    elif provider == "deepseek":
-        from langchain_openai import ChatOpenAI
-        return ChatOpenAI(
-            api_key=api_key,
-            model=model_name,
-            base_url="https://api.deepseek.com/v1",
-            **common_kwargs,
-        )
+    def _get_model_chain(self):
+        """Return ordered list of models to try. No fallback — model is locked."""
+        return [self.model_name]
 
-    elif provider == "openrouter":
-        from langchain_openai import ChatOpenAI
-        return ChatOpenAI(
-            api_key=api_key,
-            model=model_name,
-            base_url="https://openrouter.ai/api/v1",
-            **common_kwargs,
-        )
+    def invoke(self, messages):
+        last_error = None
+        for model in self._get_model_chain():
+            try:
+                content = self._non_stream_call(model, messages)
+                return AIMessage(content=content)
+            except Exception as e:
+                last_error = e
+                continue
+        if last_error:
+            raise last_error
+        raise RuntimeError("LLM invoke failed for all models in the chain")
 
-    elif provider == "perplexity":
-        from langchain_openai import ChatOpenAI
-        return ChatOpenAI(
-            api_key=api_key,
-            model=model_name,
-            base_url="https://api.perplexity.ai",
-            **common_kwargs,
-        )
+    def stream(self, messages):
+        """Try streaming first (fast), fall back to non-streaming invoke."""
+        try:
+            yield from self._stream_call(self.model_name, messages)
+            return
+        except Exception as e:
+            print(f"[LLM Stream failed: {e}] Trying non-stream invoke...", flush=True)
+        # Fallback: get full response at once, yield in chunks
+        try:
+            content = self._non_stream_call(self.model_name, messages)
+            chunk_size = 15
+            for i in range(0, len(content), chunk_size):
+                yield content[i:i + chunk_size]
+        except Exception as e2:
+            raise RuntimeError(f"LLM failed (both stream and invoke errored): {e2}")
 
-    elif provider == "together":
-        from langchain_openai import ChatOpenAI
-        return ChatOpenAI(
-            api_key=api_key,
-            model=model_name,
-            base_url="https://api.together.xyz/v1",
-            **common_kwargs,
-        )
-
-    elif provider == "xai":
-        from langchain_openai import ChatOpenAI
-        return ChatOpenAI(
-            api_key=api_key,
-            model=model_name,
-            base_url="https://api.x.ai/v1",
-            **common_kwargs,
-        )
-
-    elif provider == "nvidia":
-        from langchain_openai import ChatOpenAI
-        
-        extra_body = None
-        if "gemma" in model_name:
-            key_to_use = api_key if api_key else "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"
-            if model_name == "google/gemma-4-31b-it":
-                extra_body = {
-                    "chat_template_kwargs": {"enable_thinking": False}
-                }
-        elif model_name == "moonshotai/kimi-k2.6":
-            key_to_use = api_key if api_key else "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"
-        else:
-            key_to_use = api_key if api_key else "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"
-        
-        return ChatOpenAI(
-            api_key=key_to_use,
-            model=model_name,
-            base_url="https://integrate.api.nvidia.com/v1",
-            extra_body=extra_body,
-            **common_kwargs,
-        )
-
-    else:
-        raise ValueError(f"Unsupported AI provider: {provider}")
-
-
-def select_model_for_query(query: str) -> str:
-    """
-    Always return google/gemma-3n-e4b-it.
-    """
-    return "google/gemma-3n-e4b-it"
+def _create_nvidia_llm(model_name: str):
+    """Create NVIDIA LLM wrapper."""
+    if model_name not in ALLOWED_MODELS:
+        model_name = CHAT_MODEL
+    return _NvidiaLLM(model_name)
 
 
 class RAGEngine:
-    """
-    Multi-provider LangChain RAG engine with streaming.
-    """
+    """NVIDIA-only RAG engine with streaming."""
 
-    def __init__(self, vector_store, provider="nvidia", model_name=None, api_key=None):
-        self.vector_store = vector_store
-        self.llm = None
-        self.provider = provider
-        self.model_name = model_name or "google/gemma-3n-e4b-it"
-        self.api_key = api_key
+    def __init__(self, vector_store, model_name=None):
+        self._vector_store = vector_store
+        self.model_name = model_name or CHAT_MODEL
+        self.llm = _create_nvidia_llm(self.model_name)
         self.history = []
         self._chain = None
-
+        self._qa_chain = None
         self.cache_file = "query_cache.json"
         self._load_cache()
 
-        if api_key or provider == "nvidia":
-            self._init_llm(api_key)
+    @property
+    def vector_store(self):
+        return self._vector_store
+
+    @vector_store.setter
+    def vector_store(self, value):
+        self._vector_store = value
+        self._chain = None
+        self._qa_chain = None
 
     def _load_cache(self):
         self.cache = {}
         if os.path.exists(self.cache_file):
             try:
                 with open(self.cache_file, "r", encoding="utf-8") as f:
-                    self.cache = json.load(f)
+                    raw_cache = json.load(f)
+                # Clean up any bad/empty/fallback entries from the loaded cache
+                for q, v in raw_cache.items():
+                    ans = v.get("answer", "")
+                    if ans and not (
+                        "brief connection delay" in ans.lower() or
+                        "upload study documents" in ans.lower() or
+                        "ready to help" in ans.lower() or
+                        "temporary issue connecting" in ans.lower() or
+                        "image-like content" in ans.lower() or
+                        "Connection Issue" in ans
+                    ):
+                        self.cache[q] = v
             except Exception:
                 pass
 
@@ -181,283 +224,154 @@ class RAGEngine:
         except Exception:
             pass
 
-    def _init_llm(self, api_key: str):
-        """Initialize the LLM for the configured provider."""
-        try:
-            self.llm = _create_llm(self.provider, self.model_name, api_key)
-            self._chain = None
-        except Exception as e:
-            print(f"[RAG Engine] Failed to initialize LLM for {self.provider}/{self.model_name}: {e}")
-            self.llm = None
-
-    def _get_qa_prompt(self):
-        qa_system_prompt = (
-            "You are a Premium AI Academic Assistant. Your task is to provide expert-level answers using retrieved context.\n\n"
-            "CRITICAL PRIORITY: You MUST analyze the **Retrieved Academic Context** provided below first. If it contains relevant information, "
-            "it takes absolute precedence. Use your internal knowledge only to supplement or if the context is entirely irrelevant.\n\n"
-            f"{SYSTEM_PROMPT}\n\n"
-            "## Retrieved Academic Context\n"
-            "{context}"
-        )
-        return ChatPromptTemplate.from_messages([
-            ("system", qa_system_prompt),
-            MessagesPlaceholder("chat_history"),
-            ("human", "{input}"),
-        ])
-
-    def _get_chain(self):
-        if self._chain is not None:
-            return self._chain
-
-        if self.vector_store is None or self.llm is None:
+    def _get_retriever(self):
+        if self._vector_store is None:
             return None
+        return self._vector_store.as_retriever(search_kwargs={"k": 5})
 
-        retriever = self.vector_store.as_retriever(top_k=5)
-
-        contextualize_q_system_prompt = (
-            "Given a chat history and the latest user question "
-            "which might reference context in the chat history, "
-            "formulate a standalone question which can be understood "
-            "without the chat history. Do NOT answer the question, "
-            "just reformulate it if needed and otherwise return it as is."
-        )
-        contextualize_q_prompt = ChatPromptTemplate.from_messages([
-            ("system", contextualize_q_system_prompt),
+    def _get_qa_chain(self):
+        if self._qa_chain is not None:
+            return self._qa_chain
+        if self.llm is None:
+            return None
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", SYSTEM_PROMPT + "\n\n## Retrieved Academic Context\n{context}"),
             MessagesPlaceholder("chat_history"),
             ("human", "{input}"),
         ])
-        history_aware_retriever = create_history_aware_retriever(
-            self.llm, retriever, contextualize_q_prompt
-        )
-
-        qa_prompt = self._get_qa_prompt()
-        question_answer_chain = create_stuff_documents_chain(self.llm, qa_prompt)
-        self._chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
-        return self._chain
-
-    def set_api_key(self, api_key: str):
-        if api_key or self.provider == "nvidia":
-            self._init_llm(api_key)
-        else:
-            self.llm = None
-            self._chain = None
-
-    def has_api_key(self) -> bool:
-        return self.llm is not None
+        self._qa_chain = create_stuff_documents_chain(self.llm, prompt)
+        return self._qa_chain
 
     def detect_intent(self, query: str) -> str:
-        query_lower = query.lower()
-        if any(kw in query_lower for kw in ['difference', 'compare', 'vs', 'versus', 'distinguish', 'differentiate']):
+        q = query.lower()
+        if any(kw in q for kw in ['difference', 'compare', 'vs', 'versus']):
             return 'comparison'
-        elif any(kw in query_lower for kw in ['roadmap', 'study plan', 'schedule', 'prepare', 'preparation', 'week-wise', 'plan for']):
+        if any(kw in q for kw in ['roadmap', 'study plan', 'schedule', 'prepare']):
             return 'roadmap'
-        elif any(kw in query_lower for kw in ['solve', 'answer', 'find', 'calculate', 'compute', 'derive', 'prove', 'write a program', 'write code']):
+        if any(kw in q for kw in ['solve', 'answer', 'find', 'calculate', 'compute']):
             return 'question_solving'
-        elif any(kw in query_lower for kw in ['summarize', 'summary', 'brief', 'short notes', 'revision']):
+        if any(kw in q for kw in ['summarize', 'summary', 'brief', 'short notes']):
             return 'summary'
         return 'topic_explanation'
 
     def stream_generate_response(self, query: str, prewarmed_docs=None):
-        # Select model dynamically based on query complexity
-        selected_model = select_model_for_query(query)
-        if selected_model != self.model_name:
-            self.model_name = selected_model
-            self._init_llm(api_key=self.api_key)
-
-        # Instant visual feedback that request processing has started
-        yield f"data: {json.dumps({'token': '⚡ *Agent connecting...*  \n'})}\n\n"
-
-        if self.model_name == "moonshotai/kimi-k2.6":
-            yield f"data: {json.dumps({'token': '⚡ *Routing complex query to Kimi K2.6...*  \n'})}\n\n"
-        else:
-            yield f"data: {json.dumps({'token': '⚡ *Routing query to Study AI...*  \n'})}\n\n"
-
-        # Check query cache
         normalized_query = query.strip().lower()
+
+        # Cache check
         if normalized_query in self.cache:
-            cached_data = self.cache[normalized_query]
-            yield f"data: {json.dumps({'token': '⚡ *Retrieved from cache (Instant)*  \n\n' + cached_data['answer']})}\n\n"
-            yield f"data: {json.dumps({'intent': cached_data.get('intent', 'topic_explanation'), 'sources': cached_data.get('sources', []), 'done': True})}\n\n"
-            
-            # Update memory
+            cached = self.cache[normalized_query]
+            yield f"data: {json.dumps({'token': '**Answer:**  \n' + cached['answer']})}\n\n"
+            yield f"data: {json.dumps({'intent': cached.get('intent', 'topic_explanation'), 'sources': cached.get('sources', []), 'done': True})}\n\n"
             self.history.append(HumanMessage(content=query))
-            self.history.append(AIMessage(content=cached_data['answer']))
+            self.history.append(AIMessage(content=cached['answer']))
             return
 
+        # Start with plain Answer marker (no emoji to avoid encoding issues)
+        yield f"data: {json.dumps({'token': '**Answer:**  \n'})}\n\n"
+
         if not self.llm:
-            yield f"data: {json.dumps({'error': f'LLM not initialized. Check your API key for {self.provider}.'})}\n\n"
+            yield f"data: {json.dumps({'token': 'I am ready to help. Please upload study documents first using the sidebar.'})}\n\n"
+            yield f"data: {json.dumps({'intent': 'topic_explanation', 'sources': [], 'done': True})}\n\n"
             return
 
         try:
+            full_answer = ""
+            sources = []
+            seen_sources = set()
+
             from app_api import GLOBAL_STATE
             documents = GLOBAL_STATE.get("documents", [])
         except ImportError:
             documents = []
 
-        # Determine if we can run the fast path (RAG or direct LLM)
-        query_lower = query.lower()
-        is_doc_cmd = any(kw in query_lower for kw in ["delete", "remove", "list document", "list file", "uploaded document", "uploaded file"])
+        # Build context only if documents are actively uploaded
+        context_docs = None
+        if documents:
+            if prewarmed_docs:
+                context_docs = prewarmed_docs
+            elif self._vector_store is not None:
+                try:
+                    retriever = self._get_retriever()
+                    context_docs = retriever.invoke(query) if retriever else []
+                except Exception:
+                    context_docs = []
 
-        if not is_doc_cmd:
-            # ── Fast Single-Step Generation Path ──
-            yield f"data: {json.dumps({'token': '🤖 **Step 1 Thinking...**  \n'})}\n\n"
-            
-            try:
-                full_answer = ""
-                sources = []
-                seen_sources = set()
-                
-                chain = self._get_chain()
-                if prewarmed_docs:
-                    # Run the stuff documents chain directly using the prewarmed context documents
-                    qa_prompt = self._get_qa_prompt()
-                    question_answer_chain = create_stuff_documents_chain(self.llm, qa_prompt)
-                    
-                    stream = question_answer_chain.stream({
-                        "input": query,
-                        "chat_history": self.history,
-                        "context": prewarmed_docs
-                    })
-                    yield f"data: {json.dumps({'token': '📚 **Answer:**  \n'})}\n\n"
-                    for chunk in stream:
-                        token = chunk
-                        full_answer += token
-                        yield f"data: {json.dumps({'token': token})}\n\n"
-                    
-                    for doc in prewarmed_docs:
-                        src = doc.metadata.get("source", "Unknown")
-                        page = doc.metadata.get("page", "N/A")
-                        key = f"{src}_{page}"
-                        if key not in seen_sources:
-                            seen_sources.add(key)
-                            try:
-                                sources.append({"name": src, "page": int(page)})
-                            except ValueError:
-                                sources.append({"name": src, "page": page})
-                elif chain:
-                    # RAG retrieval chain
-                    stream = chain.stream({"input": query, "chat_history": self.history})
-                    yield f"data: {json.dumps({'token': '📚 **Answer:**  \n'})}\n\n"
-                    for chunk in stream:
-                        if "answer" in chunk:
-                            token = chunk["answer"]
-                            full_answer += token
-                            yield f"data: {json.dumps({'token': token})}\n\n"
-                        if "context" in chunk:
-                            for doc in chunk["context"]:
-                                src = doc.metadata.get("source", "Unknown")
-                                page = doc.metadata.get("page", "N/A")
-                                key = f"{src}_{page}"
-                                if key not in seen_sources:
-                                    seen_sources.add(key)
-                                    try:
-                                        sources.append({"name": src, "page": int(page)})
-                                    except ValueError:
-                                        sources.append({"name": src, "page": page})
-                    
-                    # Fallback source extraction from retriever if stream chunks did not contain context
-                    if not sources:
-                        try:
-                            retriever = self.vector_store.as_retriever(top_k=5)
-                            docs = retriever.invoke(query)
-                            for doc in docs:
-                                src = doc.metadata.get("source", "Unknown")
-                                page = doc.metadata.get("page", "N/A")
-                                key = f"{src}_{page}"
-                                if key not in seen_sources:
-                                    seen_sources.add(key)
-                                    try:
-                                        sources.append({"name": src, "page": int(page)})
-                                    except ValueError:
-                                        sources.append({"name": src, "page": page})
-                        except Exception:
-                            pass
-                else:
-                    # Direct LLM stream (no vector store/documents uploaded)
-                    messages = [SystemMessage(content=SYSTEM_PROMPT)]
-                    if self.history:
-                        messages.extend(self.history[-6:])
-                    messages.append(HumanMessage(content=query))
-                    
-                    stream = self.llm.stream(messages)
-                    yield f"data: {json.dumps({'token': '📚 **Answer:**  \n'})}\n\n"
-                    for chunk in stream:
-                        token = chunk.content
-                        full_answer += token
-                        yield f"data: {json.dumps({'token': token})}\n\n"
+        context_text = ""
+        if context_docs:
+            context_text = "\n\n".join(doc.page_content[:1400] for doc in context_docs[:5])
 
-                clean_answer = full_answer.strip()
-                intent = self.detect_intent(query)
-                
-                self.cache[normalized_query] = {
-                    "answer": clean_answer,
-                    "intent": intent,
-                    "sources": sources
-                }
-                self._save_cache()
+        system_content = SYSTEM_PROMPT
+        if context_text:
+            system_content += f"\n\nUse this retrieved context first:\n{context_text}"
 
-                self.history.append(HumanMessage(content=query))
-                self.history.append(AIMessage(content=clean_answer))
-                if len(self.history) > 12:
-                    self.history = self.history[-12:]
-                
-                yield f"data: {json.dumps({'intent': intent, 'sources': sources, 'done': True})}\n\n"
-                return
-            except Exception as e:
-                print(f"[RAG Engine] Fast path failed: {e}. Falling back to ReActAgent.")
+        messages = [SystemMessage(content=system_content)]
+        if self.history:
+            messages.extend(self.history[-6:])
+        messages.append(HumanMessage(content=query))
 
-        # ── Fallback: Goal-Driven ReActAgent Loop ──
-        from agent import ReActAgent
-        agent = ReActAgent(
-            llm=self.llm,
-            vector_store=self.vector_store,
-            documents=documents
+        # Stream from NVIDIA with automatic fallback
+        try:
+            for token_text in self.llm.stream(messages):
+                if token_text:
+                    full_answer += token_text
+                    yield f"data: {json.dumps({'token': token_text})}\n\n"
+        except Exception as e:
+            # Print exception for debug logs
+            print(f"[RAG Exception] {type(e).__name__}: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            if context_text:
+                local_answer = f"**Response based on your documents:**\n\n{context_text[:2000]}"
+                full_answer = local_answer
+                yield f"data: {json.dumps({'token': local_answer})}\n\n"
+            else:
+                fallback_msg = (
+                    f"⚠️ **Connection Issue**\n\n"
+                    f"`{type(e).__name__}: {str(e)[:200]}`\n\n"
+                    f"📌 Wait a moment and retry\n"
+                    f"📌 Check your connection"
+                )
+                full_answer = fallback_msg
+                yield f"data: {json.dumps({'token': fallback_msg})}\n\n"
+
+        # Sources
+        if context_docs:
+            for doc in context_docs:
+                src = doc.metadata.get("source", "Unknown")
+                page = doc.metadata.get("page", "N/A")
+                key = f"{src}_{page}"
+                if key not in seen_sources:
+                    seen_sources.add(key)
+                    try:
+                        sources.append({"name": src, "page": int(page)})
+                    except ValueError:
+                        sources.append({"name": src, "page": page})
+
+        clean_answer = full_answer.strip()
+        intent = self.detect_intent(query)
+
+        # Check if the answer is empty or is a fallback/delay message
+        is_fallback = (
+            not clean_answer or
+            "brief connection delay" in clean_answer.lower() or
+            "upload study documents" in clean_answer.lower() or
+            "ready to help" in clean_answer.lower() or
+            "temporary issue connecting" in clean_answer.lower() or
+            "image-like content" in clean_answer.lower() or
+            "Connection Issue" in clean_answer
         )
 
-        try:
-            full_answer = ""
-            for chunk_str in agent.stream_run(query, chat_history=self.history):
-                yield chunk_str
-                if chunk_str.startswith("data: "):
-                    try:
-                        data = json.loads(chunk_str[6:].strip())
-                        if "token" in data:
-                            full_answer += data["token"]
-                    except Exception:
-                        pass
-
-            import re
-            clean_answer = full_answer
-            if '📚 **Answer:**' in clean_answer:
-                clean_answer = clean_answer.split('📚 **Answer:**', 1)[1]
-            
-            clean_answer = re.sub(r"⚡\s*\*Agent connecting\.+\*\s*", "", clean_answer)
-            clean_answer = re.sub(r"⚡\s*\*Routing.*?\*\s*", "", clean_answer)
-            clean_answer = re.sub(r"⚡\s*\*Retrieved from cache \(Instant\)\*\s*", "", clean_answer)
-            clean_answer = re.sub(r"🤖\s*\*+Step \d+ Thinking\.+\*\*+\s*", "", clean_answer)
-            clean_answer = re.sub(r"⚙️\s*\*+Executing Tool:\*+.*?(?:\n|$)", "", clean_answer)
-            clean_answer = re.sub(r"📝\s*\*+Observation:\*+.*?(?=(?:🤖\s*\*+Step|📚\s*\*+Answer|\n\n|$))", "", clean_answer, flags=re.DOTALL)
-            clean_answer = clean_answer.strip()
-
-            sources = agent.extract_sources(agent.run_history)
-            intent = self.detect_intent(query)
-            
-            self.cache[normalized_query] = {
-                "answer": clean_answer,
-                "intent": intent,
-                "sources": sources
-            }
+        if not is_fallback:
+            self.cache[normalized_query] = {"answer": clean_answer, "intent": intent, "sources": sources}
             self._save_cache()
 
-            self.history.append(HumanMessage(content=query))
-            self.history.append(AIMessage(content=clean_answer))
-            if len(self.history) > 12:
-                self.history = self.history[-12:]
+        self.history.append(HumanMessage(content=query))
+        self.history.append(AIMessage(content=clean_answer))
+        if len(self.history) > 12:
+            self.history = self.history[-12:]
 
-        except Exception as e:
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+        yield f"data: {json.dumps({'intent': intent, 'sources': sources, 'done': True})}\n\n"
 
     def clear_history(self):
         self.history = []
         self._chain = None
-

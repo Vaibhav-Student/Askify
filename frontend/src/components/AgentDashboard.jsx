@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { Terminal, Cpu, HardDrive, Sparkles, X, Activity, RefreshCw } from './Icons';
 
-export default function AgentDashboard({ isOpen, onCloseDashboard, documents = [], totalChunks = 0, theme }) {
+export default function AgentDashboard({ isOpen, onCloseDashboard, documents = [], totalChunks = 0 }) {
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState([]);
   const [isSearching, setIsSearching] = useState(false);

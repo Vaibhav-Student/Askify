@@ -47,21 +47,52 @@ def get_embeddings() -> HuggingFaceEmbeddings:
 
 # ── In-Memory Vector Store Operations (used by app_api.py) ───────────────────
 
-def create_vector_store(text: str) -> FAISS | None:
-    """Create a temporary, in-memory FAISS index from a single string of text."""
-    # Split text into chunks
+def create_vector_store(docs: list | str) -> FAISS | None:
+    """Create a temporary, in-memory FAISS index from a list of document dicts, preserving source/page metadata."""
+    langchain_docs = []
+    
+    # Handle string input for safety / compatibility
+    if isinstance(docs, str):
+        docs = [{"name": "Unknown", "text": docs}]
+
+    for doc in docs:
+        name = doc.get("name", "Unknown")
+        pages = doc.get("pages")
+        if not pages:
+            # Fallback if pages not populated
+            pages = [{"text": doc.get("text", ""), "page": 1}]
+            
+        for page in pages:
+            page_text = page.get("text", "")
+            page_num = page.get("page", 1)
+            if page_text.strip():
+                langchain_docs.append(
+                    Document(
+                        page_content=page_text,
+                        metadata={
+                            "source": name,
+                            "page": page_num
+                        }
+                    )
+                )
+
+    if not langchain_docs:
+        return None
+
+    # Split documents into chunks using RecursiveCharacterTextSplitter
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=500,
         chunk_overlap=100
     )
-
-    chunks = text_splitter.split_text(text)
-    if not chunks:
-        return None
+    chunks = text_splitter.split_documents(langchain_docs)
+    
+    # Add chunk index for extra trace details
+    for idx, chunk in enumerate(chunks):
+        chunk.metadata["chunk_index"] = idx
 
     # Get embeddings and build FAISS index
     embeddings = get_embeddings()
-    vector_store = FAISS.from_texts(chunks, embeddings)
+    vector_store = FAISS.from_documents(chunks, embeddings)
     return vector_store
 
 

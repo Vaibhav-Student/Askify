@@ -71,6 +71,104 @@ def load_multiple_pdfs(uploaded_files):
     return all_text
 
 
+def extract_text_and_pages(file_bytes_or_stream, filename: str):
+    """
+    Extracts flat text and page-by-page structures from a file stream/bytes.
+    Returns (text, pages) where pages is a list of {"text": str, "page": int/str}.
+    """
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    text = ""
+    pages = []
+    
+    # Ensure we have a stream/file-like object
+    if isinstance(file_bytes_or_stream, bytes):
+        stream = io.BytesIO(file_bytes_or_stream)
+    else:
+        stream = file_bytes_or_stream
+        
+    if ext == "pdf":
+        try:
+            pdf_reader = PdfReader(stream)
+            for i, page in enumerate(pdf_reader.pages):
+                extracted = page.extract_text()
+                if extracted and extracted.strip():
+                    extracted_strip = extracted.strip()
+                    pages.append({"text": extracted_strip, "page": i + 1})
+                    text += extracted_strip + "\n"
+        except Exception as e:
+            logger.error(f"Error parsing PDF: {e}")
+            raise e
+    elif ext in ("pptx", "ppt"):
+        try:
+            prs = Presentation(stream)
+            for i, slide in enumerate(prs.slides):
+                slide_text = []
+                for shape in slide.shapes:
+                    # Table shapes: extract cell text row by row
+                    if shape.has_table:
+                        table = shape.table
+                        for row in table.rows:
+                            row_cells = []
+                            for cell in row.cells:
+                                cell_text = cell.text.strip()
+                                if cell_text:
+                                    row_cells.append(cell_text)
+                            if row_cells:
+                                slide_text.append(" | ".join(row_cells))
+                    # Grouped shapes: recurse into group
+                    elif shape.shape_type is not None and hasattr(shape, "shapes"):
+                        for sub_shape in shape.shapes:
+                            if hasattr(sub_shape, "text") and sub_shape.text.strip():
+                                slide_text.append(sub_shape.text.strip())
+                    # Regular shapes with text
+                    elif hasattr(shape, "text") and shape.text.strip():
+                        slide_text.append(shape.text.strip())
+                slide_content = "\n".join(slide_text).strip()
+                if slide_content:
+                    pages.append({"text": slide_content, "page": i + 1})
+                    text += slide_content + "\n"
+        except Exception as e:
+            logger.error(f"Error parsing PPTX: {e}")
+            raise e
+    elif ext in ("xlsx", "xls"):
+        try:
+            wb = openpyxl.load_workbook(stream, data_only=True)
+            for sheet in wb.sheetnames:
+                sheet_text = []
+                ws = wb[sheet]
+                for row in ws.iter_rows(values_only=True):
+                    row_text = " | ".join([str(cell) if cell is not None else "" for cell in row])
+                    if row_text.strip():
+                        sheet_text.append(row_text.strip())
+                sheet_content = "\n".join(sheet_text).strip()
+                if sheet_content:
+                    pages.append({"text": sheet_content, "page": sheet})
+                    text += f"--- Sheet: {sheet} ---\n" + sheet_content + "\n"
+        except Exception as e:
+            logger.error(f"Error parsing Excel: {e}")
+            raise e
+    else:
+        # Fallback for all other file types
+        try:
+            raw = stream.read() if hasattr(stream, "read") else stream
+            if isinstance(raw, bytes):
+                try:
+                    text = raw.decode("utf-8")
+                except Exception:
+                    text = raw.decode("latin-1")
+            else:
+                text = str(raw)
+        except Exception as e:
+            logger.error(f"Error decoding text: {e}")
+            text = f"[Binary/Non-text content for {filename}]"
+            
+        text_strip = text.strip()
+        pages.append({"text": text_strip, "page": 1})
+        text = text_strip
+        
+    return text, pages
+
+
 # ── Document Type Detection & Path-Based Processing (used by app.py) ──────────
 
 # Keyword patterns for classification
