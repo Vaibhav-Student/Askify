@@ -1,8 +1,9 @@
 node_modules/
+frontend/node_modules/
 venv/
 .venv/
-__pycache__/
 .pytest_cache/
+__pycache__/
 *.pyc
 *.log
 out.txt
@@ -10,15 +11,9 @@ bundle_check.txt
 lint_output.txt
 lint_out.txt
 server*.log
-server*_log.txt
 srv*.log
 frontend/build_out.txt
 frontend/eslint_report.txt
 frontend/eslint_report.json
-frontend/node_modules/
-frontend/dist/
-static_react/
-static_react/assets/
-data/uploads/
+data/uploads/chunks/
 query_cache.json
-terminal.integrated.defaultProfile.windows=Command Prompt

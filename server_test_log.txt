@@ -1,0 +1,12 @@
+[Warmup] Skipping eager embedding load to conserve memory. Embedding model will load lazily if/when documents are uploaded.
+ * Serving Flask app 'app_api'
+ * Debug mode: on
+WARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:7860
+ * Running on http://10.224.11.81:7860
+Press CTRL+C to quit
+C:\Users\Lenovo\AppData\Roaming\Python\Python313\site-packages\requests\__init__.py:113: RequestsDependencyWarning: urllib3 (2.5.0) or chardet (7.4.3)/charset_normalizer (3.4.4) doesn't match a supported version!
+  warnings.warn(
+[Warmup] minimaxai/minimax-m3 Chat client initialized.
+[Warmup] google/gemma-3n-e4b-it Study Hub client initialized.
